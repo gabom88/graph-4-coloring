@@ -1,0 +1,3086 @@
+<!doctype html>
+<!--
+  ============================================================
+  APLICACIÓN: 4-Coloreo Planar — Editor + Árbol de Búsqueda
+  ============================================================
+  Esta es una Single Page Application (SPA) que implementa tres
+  sistemas integrados:
+
+    1. EDITOR DE GRAFOS PLANARES
+       — Dibujo manual de vértices y aristas sobre un canvas HTML5.
+       — Snap (ajuste) a una cuadrícula de doble resolución (GRID_SIZE y GRID_SIZE/2).
+       — Restricción de planaridad en tiempo real: impide añadir aristas que crucen otras.
+       — Permite arrastrar vértices conservando la planaridad.
+       — Importación y exportación del grafo en formato JSON.
+
+    2. ALGORITMO DE 4-COLOREO CON BACKTRACKING
+       — Calcula capas (layers) del grafo por eliminación iterativa de la cara exterior.
+       — Triangula el grafo añadiendo aristas "virtuales" punteadas (ear clipping).
+       — Selecciona el triángulo más interno como núcleo inicial, asignando colores 1, 2, 3.
+       — Búsqueda DFS con:
+           · Heurística MRV (Minimum Remaining Values) para elegir el próximo vértice.
+           · Heurística LCV (Least Constraining Value) para ordenar los colores.
+           · Forward Checking como poda (detecta dominios vacíos antes de explorar).
+       — Control manual paso a paso: el usuario avanza o retrocede cada decisión.
+
+    3. ÁRBOL DE BÚSQUEDA SVG
+       — Se construye y actualiza en tiempo real conforme el algoritmo avanza.
+       — Nodos coloreados según su estado: vivo (azul), podado (naranja), fallo (rojo), éxito (verde).
+       — Al hacer clic en un nodo, se restaura el coloreo del grafo a ese instante.
+       — Sistema de historial completo (undo/redo) con snapshots serializados.
+  ============================================================
+-->
+<html lang="es">
+<head>
+  <!-- Codificación de caracteres UTF-8: permite tildes, eñes y símbolos Unicode -->
+  <meta charset="utf-8"/>
+  <!-- Viewport responsivo: la app ocupa el 100% del ancho del dispositivo sin zoom inicial -->
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>4-Coloreo Planar • Editor + Árbol (Manual)</title>
+
+  <style>
+    /*
+    ============================================================
+    SECCIÓN DE ESTILOS CSS
+    ============================================================
+    Se usa una arquitectura de variables CSS globales (:root) para
+    mantener coherencia de color en toda la interfaz. Todos los
+    componentes consumen estas variables, y JavaScript también las
+    lee en tiempo de ejecución con getComputedStyle().
+    */
+
+    :root {
+      /* Color de fondo general de la página (azul muy pálido, casi blanco) */
+      --bg: #f6f8ff;
+      /* Color de fondo de las tarjetas (paneles internos) */
+      --card: #ffffff;
+      /* Color principal del texto — casi negro con tinte azul */
+      --ink: #16213a;
+      /* Color del texto secundario: etiquetas, pies de foto, notas */
+      --muted: #5b6b8a;
+      /* Color de bordes sutiles entre componentes */
+      --line: #d8e1f4;
+      /* Azul vivo: botones primarios, nodos "vivos" del árbol, aristas virtuales */
+      --accent: #0ea5e9;
+      /* Verde: éxito, coloreo completo, nodos resueltos */
+      --ok: #16a34a;
+      /* Rojo: error, fallo de backtracking, aristas no permitidas */
+      --bad: #ef4444;
+      /* Amarillo/naranja: podas (ramas descartadas por forward checking) */
+      --warn: #f59e0b;
+      /* Líneas finas de subdivisión del grid del canvas */
+      --grid: #eef2ff;
+      /* Líneas gruesas del grid del canvas (divisiones mayores de 40px) */
+      --gridBold: #d6def7;
+      /* Sombra de elevación para las tarjetas */
+      --shadow: 0 10px 30px rgba(15, 23, 42, .10);
+    }
+
+    /* Aplica box-sizing:border-box a todos los elementos:
+       los padding y bordes se incluyen dentro del width/height declarado */
+    * { box-sizing: border-box }
+
+    /* Body: sin margen, tipografía de sistema con fallbacks multiplataforma,
+       texto en --ink, fondo en --bg */
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Arial;
+      color: var(--ink);
+      background: var(--bg)
+    }
+
+    /* Cabecera fija superior: padding reducido, borde inferior sutil,
+       degradado blanco→azul muy claro para dar sensación de elevación */
+    header {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #ffffff, #f3f6ff)
+    }
+
+    /* Título principal de la app: sin margen, tamaño pequeño (14px),
+       tracking ajustado (+0.2px) para mejor legibilidad */
+    header h1 { margin: 0; font-size: 14px; letter-spacing: .2px }
+
+    /* Subtítulo descriptivo debajo del h1 */
+    header .sub { margin: 4px 0 0 0; font-size: 12px; color: var(--muted) }
+
+    /*
+      LAYOUT PRINCIPAL
+      La etiqueta <main> ocupa toda la altura del viewport menos los 62px
+      del header. Se divide en 2 columnas iguales con CSS Grid.
+      gap y padding: 12px para crear espacio visual entre paneles.
+      min-height:0 es necesario para que flex/grid respeten correctamente
+      la altura en hijos con overflow:auto.
+    */
+    main {
+      height: calc(100vh - 62px);
+      display: grid;
+      grid-template-columns: 50% 50%;
+      gap: 12px;
+      padding: 12px;
+      min-height: 0;
+    }
+
+    /* Cada mitad (columna) es un contenedor flex vertical con gap entre tarjetas */
+    .half { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+
+    /*
+      TARJETA (card)
+      Contenedor base de cada panel de la interfaz.
+      border-radius:14px + sombra suave para apariencia moderna.
+      overflow:hidden recorta el contenido que salga de los bordes redondeados.
+      min-height:0 permite que las tarjetas se compriman en layouts flex/grid.
+    */
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    /*
+      BARRA DE TÍTULO DE CADA TARJETA (.bar)
+      Línea horizontal con título a la izquierda y controles a la derecha.
+      justify-content:space-between los separa en extremos opuestos.
+      flex-wrap:wrap permite que los botones pasen a la siguiente línea
+      en pantallas pequeñas.
+    */
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #ffffff, #f7f9ff);
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    /* Título de la tarjeta: negrita, tamaño 13px */
+    .title { font-weight: 700; font-size: 13px }
+
+    /* Contenedor de controles del lado derecho de la barra */
+    .right { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+
+    /*
+      BOTÓN BASE (.btn)
+      Diseño de botón plano con borde gris claro y fondo blanco.
+      border-radius:10px para aspecto suave.
+      appearance:none elimina los estilos por defecto del navegador.
+    */
+    .btn {
+      appearance: none;
+      border: 1px solid #cdd7f1;
+      background: #ffffff;
+      color: var(--ink);
+      padding: 7px 10px;
+      border-radius: 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    /* Al pasar el cursor, el borde se oscurece ligeramente */
+    .btn:hover { border-color: #9eb3ee }
+
+    /*
+      BOTÓN PRIMARIO (.btn.primary)
+      Borde y fondo azul translúcidos — indica acción principal del panel.
+      Usado en "Iniciar búsqueda".
+    */
+    .btn.primary {
+      border-color: rgba(14, 165, 233, .35);
+      background: rgba(14, 165, 233, .10);
+    }
+
+    /*
+      BOTÓN DE PELIGRO (.btn.danger)
+      Borde y fondo rojo translúcidos — indica acción destructiva.
+      Usado en "Borrar grafo".
+    */
+    .btn.danger {
+      border-color: rgba(239, 68, 68, .35);
+      background: rgba(239, 68, 68, .08);
+    }
+
+    /* Estado deshabilitado: reduce opacidad y cambia cursor a "no permitido" */
+    .btn:disabled { opacity: .55; cursor: not-allowed }
+
+    /*
+      ETIQUETA TIPO "PILL" (.pill)
+      Indicador de estado o contador con bordes completamente redondeados.
+      Usado para mostrar conteos, estados del editor, metadatos de JSON, etc.
+    */
+    .pill {
+      font-size: 12px;
+      color: var(--muted);
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff
+    }
+
+    /* Área de contenido interno de cada tarjeta */
+    .content { padding: 10px 12px; min-height: 0; height: 100% }
+
+    /*
+      CONTENEDOR DEL CANVAS (.canvasWrap)
+      overflow:auto permite hacer scroll cuando el canvas es más grande
+      que el área visible. Esto imita el comportamiento de un editor de
+      grafos con espacio de trabajo extenso (como en la versión 5 referenciada).
+    */
+    .canvasWrap {
+      height: 100%;
+      width: 100%;
+      overflow: auto;
+      background: #fbfcff;
+    }
+
+    /* El canvas se comporta como bloque con fondo blanco */
+    canvas { display: block; background: #ffffff }
+
+    /* Texto auxiliar pequeño en paneles informativos */
+    .small { font-size: 11px; color: var(--muted) }
+
+    /*
+      CONTENEDOR DEL ÁRBOL SVG (.treeWrap)
+      Idéntico en concepto a .canvasWrap pero para el SVG del árbol.
+      overflow:auto en ambos ejes permite navegar árboles muy grandes.
+    */
+    .treeWrap {
+      height: 100%;
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: auto;
+      background: #ffffff;
+    }
+
+    /* El elemento SVG se muestra como bloque para eliminar el espacio inferior
+       que añaden los elementos inline por defecto */
+    svg { display: block }
+
+    /*
+      PANEL DE DETALLES DEL NODO (.details)
+      white-space:pre-wrap preserva los saltos de línea del texto de asignación
+      que se construye dinámicamente al seleccionar un nodo del árbol.
+    */
+    .details {
+      padding: 10px 12px;
+      font-size: 12px;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+
+    /*
+      PANEL DE LOG (.log)
+      Fuente monoespaciada para mensajes del algoritmo.
+      overflow:auto con scroll automático al final (gestionado desde JS).
+      min-height:90px garantiza que siempre sea visible aunque haya pocas líneas.
+    */
+    .log {
+      height: 100%;
+      min-height: 90px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: auto;
+      background: #ffffff;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: #0f172a;
+    }
+
+    /* Cada línea del log tiene margen inferior para separación visual */
+    .line { margin: 0 0 6px 0; white-space: pre-wrap }
+
+    /* Clases de color por nivel de log:
+       .INFO = negro (texto neutral)
+       .PRUNE = naranja/amarillo (poda/backtracking detectado)
+       .FAIL = rojo (error o fallo del algoritmo)
+       .OK = verde (éxito o confirmación) */
+    .INFO { color: #0f172a }
+    .PRUNE { color: #0000ff }
+    .FAIL { color: #ff3300 }
+    .OK { color: var(--ok) }
+
+    /*
+      LEYENDA DEL ÁRBOL (.legend + .dot)
+      Muestra pequeños círculos de colores con etiquetas para explicar
+      el significado de los nodos del árbol de búsqueda.
+    */
+    .legend {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--muted)
+    }
+
+    /* Punto base de la leyenda: círculo de 10x10px */
+    .dot { width: 10px; height: 10px; border-radius: 50% }
+
+    /* Variantes de color por estado del nodo del árbol */
+    .dot.live { background: var(--accent) }  /* azul: nodo activo, pendiente */
+    .dot.ok { background: var(--ok) }        /* verde: solución encontrada */
+    .dot.fail { background: var(--bad) }     /* rojo: rama fallida */
+    .dot.prune { background: var(--warn) }   /* amarillo: podado por FC */
+  </style>
+</head>
+<body>
+
+<!--
+  ============================================================
+  CABECERA
+  Muestra el título de la aplicación y una descripción resumida
+  de las características principales implementadas.
+  ============================================================
+-->
+<header>
+  <h1>4-Coloreo Planar • Editor + Árbol de Búsqueda (control manual)</h1>
+  <div class="sub">Malla estilo "gridSize + gridSize/2" (como tu versión 5), sin cruces, JSON por archivo, layers, backtracking con podas; el árbol se dibuja conforme avanza el algoritmo.</div>
+</header>
+
+<!--
+  ============================================================
+  CONTENIDO PRINCIPAL
+  Dividido en dos mitades mediante CSS Grid (50% / 50%).
+  - Mitad A (izquierda): editor del grafo + controles del algoritmo.
+  - Mitad B (derecha): árbol de búsqueda + log + detalles del nodo.
+  ============================================================
+-->
+<main>
+
+  <!-- ======================================================
+       MITAD A — Editor del grafo y controles del algoritmo
+       ====================================================== -->
+  <section class="half">
+
+    <!--
+      PANEL A1: Dibujo del grafo
+      Contiene el canvas principal donde el usuario:
+        - Hace clic para crear vértices (en modo Vértices).
+        - Hace clic en dos vértices para crear aristas (en modo Aristas).
+        - Hace clic sobre un elemento para borrarlo (en modo Borrar).
+        - Arrastra vértices para reposicionarlos (en modo Vértices).
+      El canvas tiene scroll si es más grande que el área visible.
+    -->
+    <div class="card" style="flex: 1; min-height:0;">
+      <div class="bar">
+        <div class="title">A1) Dibujo del grafo</div>
+        <div class="right">
+          <!-- Botón que activa el modo de creación/arrastre de vértices -->
+          <button class="btn" id="modeVertex">Modo: Vértices</button>
+
+          <!-- Botón que activa el modo de creación de aristas (requiere 2 clics) -->
+          <button class="btn" id="modeEdge">Modo: Aristas</button>
+
+          <!-- Botón que activa el modo de borrado (clic en vértice o arista) -->
+          <button class="btn" id="modeDelete">Modo: Borrar</button>
+
+          <!--
+            Checkbox para mostrar/ocultar las aristas "virtuales" (punteadas).
+            Las aristas virtuales son las que agrega automáticamente la triangulación
+            para convertir el grafo en un grafo planar maximal.
+            Están marcadas por defecto (checked).
+          -->
+          <label class="pill" style="display:flex;gap:6px;align-items:center;">
+            <input type="checkbox" id="toggleVirtual" checked style="accent-color: var(--accent);"/>
+            <span style="font-size:12px;color:var(--muted);">Virtuales</span>
+          </label>
+
+          <!-- Botón destructivo: limpia V[], E[] y reinicia el grafo completo -->
+          <button class="btn danger" id="clearGraph">Borrar grafo</button>
+
+          <!-- Etiqueta dinámica que muestra el modo actual y las instrucciones del modo -->
+          <span class="pill" id="editStatus">—</span>
+        </div>
+      </div>
+
+      <!-- El contenido es el canvasWrap + el canvas dibujable -->
+      <div class="content" style="padding:0; height:100%">
+        <!--
+          canvasWrap: div con overflow:auto que permite hacer scroll
+          cuando el canvas (960×720px) supera el área visible del panel.
+        -->
+        <div class="canvasWrap" id="canvasWrap">
+          <!--
+            Canvas principal de edición del grafo.
+            Dimensiones: se establecen dinámicamente por setCanvasSize() en JS.
+            Valor por defecto en JS: 24 celdas × 40px = 960px ancho, 18 × 40 = 720px alto.
+          -->
+          <canvas id="gCanvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!--
+      PANEL A2: Importación y exportación JSON
+      Permite guardar el grafo en disco y cargarlo en sesiones futuras.
+      El panel muestra un texto de ayuda (jsonMeta) que se actualiza
+      tras cada importación o exportación.
+    -->
+    <div class="card" style="flex: 0 0 auto;">
+      <div class="bar">
+        <div class="title">A2) JSON</div>
+        <div class="right">
+          <!-- Botón que dispara el selector de archivos del sistema operativo -->
+          <button class="btn" id="importBtn">Importar JSON</button>
+
+          <!-- Botón que serializa V[] y E[] y descarga el archivo grafo_planar.json -->
+          <button class="btn" id="exportBtn">Exportar JSON</button>
+
+          <!--
+            Input de archivo oculto.
+            Al hacer clic en "Importar JSON", JS simula un clic sobre este elemento.
+            Solo acepta archivos .json o application/json.
+          -->
+          <input id="fileInput" type="file" accept=".json,application/json" style="display:none"/>
+        </div>
+      </div>
+      <div class="content" style="padding:8px 12px">
+        <!-- Texto informativo: cambia para indicar la última operación JSON realizada -->
+        <div class="small" id="jsonMeta">—</div>
+      </div>
+    </div>
+
+    <!--
+      PANEL A3: Controles del algoritmo
+      Botones para gestionar la ejecución del algoritmo de 4-coloreo:
+        - "Calcular Layers": ejecuta computeLayers() aislado (sin iniciar la búsqueda).
+        - "Iniciar búsqueda": triangula, calcula layers e inicializa el DFS.
+        - "Paso anterior": retrocede un paso en el historial de snapshots.
+        - "Siguiente paso": avanza un paso (calculando si es el último, o rehaciendo si hay redo).
+    -->
+    <div class="card" style="flex: 0 0 auto;">
+      <div class="bar">
+        <div class="title">A3) Algoritmo</div>
+        <div class="right">
+          <!-- Solo calcula y asigna v.layer a cada vértice sin iniciar el DFS -->
+          <button class="btn" id="layersBtn">Calcular Layers</button>
+
+          <!--
+            Botón principal: orquesta triangulación + layers + initSearch().
+            Se deshabilita una vez iniciada la búsqueda para evitar reinicios accidentales.
+          -->
+          <button class="btn primary" id="startBtn">Iniciar búsqueda</button>
+
+          <!-- Retrocede al snapshot anterior (undo del paso) — empieza deshabilitado -->
+          <button class="btn" id="prevBtn" disabled>Paso anterior</button>
+
+          <!-- Avanza al siguiente paso del DFS — empieza deshabilitado -->
+          <button class="btn" id="nextBtn" disabled>Siguiente paso</button>
+        </div>
+      </div>
+      <div class="content" style="padding:8px 12px">
+        <!-- Muestra: |V|=n  |E|=m — se actualiza en cada draw() --> <center><b style="color: red">Color 1 = rojo</b>, <b style="color: blue">color 2 = azul</b>, <b style="color: green">Color 3 = verde</b>, <b style="color: #D1C000">Color 4 = amarillo</b>.</center>
+        <div class="small" id="stats">—</div>
+      </div>
+    </div>
+
+  </section><!-- /Mitad A -->
+
+
+  <!-- ======================================================
+       MITAD B — Árbol de búsqueda, detalles y log
+       ====================================================== -->
+  <section class="half">
+
+    <!--
+      PANEL B1: Árbol de búsqueda SVG
+      El SVG crece dinámicamente a medida que el algoritmo añade nodos.
+      Soporta scroll horizontal y vertical para árboles grandes.
+      Al hacer clic en cualquier nodo se restaura el coloreo del grafo
+      al estado exacto de ese nodo.
+    -->
+    <div class="card" style="flex: 1; min-height:0; padding: 0 0 52px 0; display: none;">
+      <div class="bar">
+        <div class="title">B1) Árbol de búsqueda (scroll H/V)</div>
+        <div class="right">
+          <!--
+            Leyenda visual de los colores de los nodos.
+            Nota: las clases .dot.prune, .dot.fail y .dot.ok tienen un error tipográfico
+            en el HTML original (usan "dot.prune" con punto en lugar de dos clases),
+            por lo que algunos puntos podrían no renderizar el color esperado sin CSS adicional.
+          -->
+          <div class="legend">
+            <span class="dot live"></span>vivo      <!-- Azul: nodo aún explorable -->
+            <span class="dot.prune"></span>podado   <!-- Naranja: descartado por FC -->
+            <span class="dot.fail"></span>falla     <!-- Rojo: sin colores posibles -->
+            <span class="dot.ok"></span>éxito       <!-- Verde: coloreo completo -->
+          </div>
+
+          <!-- Hace scroll en el treeWrap para centrar el nodo actualmente seleccionado -->
+          <button class="btn" id="centerOnSelected">Centrar seleccionado</button>
+        </div>
+      </div>
+
+      <div class="content" style="height:100%">
+        <!--
+          treeWrap: contenedor scrollable del SVG.
+          El SVG se redimensiona dinámicamente según el número de nodos y profundidad.
+          Tamaño inicial: 1200×900px (suficiente para grafos pequeños/medianos).
+        -->
+        <div class="treeWrap" id="treeWrap">
+          <svg id="treeSvg" width="1200" height="900"></svg>
+        </div>
+      </div>
+    </div>
+
+    <!--
+      PANEL B2: Detalles del nodo seleccionado
+      Muestra, al hacer clic en un nodo del árbol:
+        - Número de nodo, profundidad y estado (live/ok/fail/prune).
+        - La asignación completa: v1=2, v3=1, v5=4... en ese punto del DFS.
+      También aplica esa asignación al canvas del grafo para visualización inmediata.
+    -->
+    <div class="card" style="flex: 0 0 auto; display: none;">
+      <div class="bar">
+        <div class="title">B2) Detalles (nodo seleccionado)</div>
+        <div class="right">
+          <!-- Muestra el ID del nodo seleccionado, actualizado por selectNode() -->
+          <span class="pill" id="selMeta">—</span>
+        </div>
+      </div>
+      <!-- Texto con white-space:pre-wrap para preservar saltos de línea de la asignación -->
+      <div class="details" id="nodeDetails">Haz click en un nodo del árbol para ver el estado del coloreo en el grafo.</div>
+    </div>
+
+    <!--
+      PANEL B3: Log de eventos
+      Registro cronológico de todas las operaciones del algoritmo:
+        - INFO (negro): acciones normales, creación de vértices/aristas, pasos.
+        - OK (verde): éxitos, importaciones correctas, inicio de búsqueda.
+        - FAIL (rojo): errores, imposibilidad de añadir aristas, fallos del DFS.
+        - PRUNE (naranja): podas detectadas por forward checking.
+      Se actualiza automáticamente con scroll al final.
+    -->
+    <div class="card" style="flex: 0 0 100%; min-height: 0;">
+      <div class="bar">
+        <div class="title">B1) LOG</div>
+        <div class="right">
+          <!-- Contador de líneas del log, actualizado en cada llamada a log() -->
+          <span class="pill" id="logMeta">—</span>
+        </div>
+      </div>
+      <div class="content" style="height:94%">
+        <!-- div scrollable donde se añaden dinámicamente los <div class="line"> del log -->
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+
+  </section><!-- /Mitad B -->
+
+</main><!-- /main -->
+
+
+<!--
+  ============================================================
+  JAVASCRIPT — Lógica completa de la aplicación
+  ============================================================
+  Todo el código está envuelto en una IIFE (Immediately Invoked
+  Function Expression): (() => { ... })()
+
+  Esto crea un scope privado que:
+    - Evita contaminar el objeto global `window`.
+    - Encapsula todas las variables y funciones internas.
+    - Permite que se ejecute automáticamente al cargar la página.
+  ============================================================
+-->
+<script>
+(() => {
+
+  /*
+    ============================================================
+    UTILIDAD BÁSICA
+    ============================================================
+  */
+
+  /*
+    Alias corto para document.getElementById().
+    Se usa en todo el código en lugar de la versión larga.
+    Ejemplo: $("log") equivale a document.getElementById("log").
+  */
+  const $ = (id) => document.getElementById(id);
+
+  /*
+    Mapa de número de color → valor hexadecimal CSS.
+    Los colores son:
+      0 = gris claro (sin asignar / estado inicial)
+      1 = rojo
+      2 = azul
+      3 = verde
+      4 = naranja/amarillo
+    El Teorema de los 4 Colores garantiza que siempre bastan 4 colores (1-4).
+    El 0 se usa como estado "no coloreado todavía".
+  */
+  const COLORS = {0:"#cbd5e1", 1:"#ef4444", 2:"#0ea5e9", 3:"#22c55e", 4:"#f59e0b"};
+
+
+  /*
+    ============================================================
+    SISTEMA DE LOGGING
+    ============================================================
+    Gestiona el panel B3 (LOG) de la interfaz.
+    Todos los eventos importantes del algoritmo se registran aquí
+    para que el usuario pueda seguir el progreso del DFS.
+    ============================================================
+  */
+
+  /* Referencia al div#log donde se añaden las líneas del log */
+  const logEl = $("log");
+
+  /* Contador global de líneas, se muestra en la pill #logMeta */
+  let logCount = 0;
+
+  /* Devuelve la hora actual formateada como HH:MM:SS para cada línea del log */
+  function now() { return new Date().toLocaleTimeString(); }
+
+  /*
+    log(level, msg): añade una línea al panel de log.
+
+    Parámetros:
+      level: string — "INFO" | "OK" | "FAIL" | "PRUNE"
+              Determina el color de la línea (ver clases CSS .INFO, .OK, .FAIL, .PRUNE).
+      msg: string — texto descriptivo del evento.
+
+    Funcionamiento:
+      1. Crea un <div> con clase "line [level]" (p.ej. "line FAIL").
+      2. Establece el texto como "[HH:MM:SS] LEVEL: mensaje".
+      3. Lo añade al final del div#log.
+      4. Hace scroll automático al final para mostrar siempre el último mensaje.
+      5. Incrementa logCount y actualiza la pill contadora.
+  */
+  function log(level, msg) {
+    const div = document.createElement("div");
+    div.className = "line " + level;
+    div.textContent = `[${now()}] ${level}: ${msg}`;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight; /* scroll automático al último mensaje */
+    logCount++;
+    $("logMeta").textContent = `${logCount} líneas`;
+  }
+
+
+  /*
+    ============================================================
+    CANVAS Y SISTEMA DE COORDENADAS
+    ============================================================
+    El editor de grafos usa un canvas HTML5 con un sistema de
+    coordenadas propio que difiere del sistema de píxeles:
+
+    PÍXELES (sistema del canvas):
+      - Origen (0,0) en la esquina SUPERIOR IZQUIERDA.
+      - Eje Y crece hacia ABAJO.
+      - Unidad: 1 píxel.
+
+    COORDENADAS (sistema matemático del grafo):
+      - Origen (0,0) en la esquina INFERIOR IZQUIERDA.
+      - Eje Y crece hacia ARRIBA (estilo matemático/TikZ).
+      - Unidad: 1 = GRID_SIZE píxeles = 40px.
+      - Resolución mínima: 0.5 unidades = HALF = 20px.
+
+    Este doble sistema permite que las posiciones de los vértices
+    sean coordenadas racionales independientes de la resolución del canvas.
+    ============================================================
+  */
+
+  /* Referencia al elemento canvas y su contenedor scrollable */
+  const canvas = $("gCanvas");
+  const wrap = $("canvasWrap");
+
+  /* Contexto 2D del canvas: objeto principal para todas las operaciones de dibujo */
+  const ctx = canvas.getContext("2d");
+
+  /* Tamaño en píxeles de cada celda principal de la cuadrícula */
+  const GRID_SIZE = 40;
+
+  /* Tamaño de la subdivisión menor de la cuadrícula (mitad de GRID_SIZE) */
+  const HALF = GRID_SIZE / 2; /* = 20px */
+
+  /* Número de celdas en cada dimensión del canvas */
+  let gridW = 24; /* Ancho: 24 × 40px = 960px */
+  let gridH = 18; /* Alto: 18 × 40px = 720px */
+
+  /*
+    setCanvasSize(): establece las dimensiones físicas del canvas en píxeles.
+    Se llama una vez al inicio para dar tamaño al canvas.
+    El canvas resultante (960×720px) es más grande que el panel visible,
+    lo que activa el scroll en canvasWrap y permite navegar por él.
+  */
+  function setCanvasSize() {
+    canvas.width  = gridW * GRID_SIZE; /* 960px */
+    canvas.height = gridH * GRID_SIZE; /* 720px */
+    draw(); /* redibuja el grid vacío */
+  }
+
+  /*
+    snapToHalf(x, y): redondea coordenadas de píxeles al múltiplo de HALF más cercano.
+    Esto "engancha" el cursor a la subdivisión de la cuadrícula al crear vértices.
+    Ejemplo: (53, 71) → (60, 60) si HALF=20.
+  */
+  function snapToHalf(x, y) {
+    return { x: Math.round(x/HALF)*HALF, y: Math.round(y/HALF)*HALF };
+  }
+
+  /*
+    FUNCIONES DE CONVERSIÓN ENTRE SISTEMAS DE COORDENADAS
+
+    pxToCoordX(px): convierte píxeles X → coordenadas X.
+      Ejemplo: 80px → 2.0 (con GRID_SIZE=40).
+      El + y toFixed(2) aseguran un número flotante limpio sin ruido de punto flotante.
+
+    pxToCoordY(py): convierte píxeles Y → coordenadas Y.
+      Invierte el eje: el origen matemático está abajo.
+      Ejemplo: en un canvas de 720px de alto, py=680 → (720-680)/40 = 1.0.
+
+    coordToPxX(x): convierte coordenadas X → píxeles X.
+    coordToPxY(y): convierte coordenadas Y → píxeles Y (invierte el eje).
+  */
+  function pxToCoordX(px)  { return +(px / GRID_SIZE).toFixed(2); }
+  function pxToCoordY(py)  { return +((canvas.height - py) / GRID_SIZE).toFixed(2); }
+  function coordToPxX(x)   { return x * GRID_SIZE; }
+  function coordToPxY(y)   { return canvas.height - y * GRID_SIZE; }
+
+  /*
+    drawGrid(): dibuja la cuadrícula de fondo del canvas.
+
+    Dibuja dos capas de líneas:
+      1. LÍNEAS GRUESAS (cada GRID_SIZE=40px): color --gridBold, grosor 1px.
+         Delimitan las celdas principales (unidades enteras del sistema de coords).
+      2. LÍNEAS FINAS (cada HALF=20px): color --grid, grosor 0.5px.
+         Subdividen cada celda en 4 subcuadrantes (posiciones de 0.5 unidades).
+
+    getCss() se usa para leer las variables CSS en tiempo de ejecución,
+    permitiendo que los colores del grid cambien si se modifica el CSS.
+  */
+  function drawGrid() {
+    /* --- Líneas gruesas --- */
+    ctx.strokeStyle = getCss("--gridBold");
+    ctx.lineWidth = 1;
+    for (let x = 0; x <= canvas.width; x += GRID_SIZE) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = 0; y <= canvas.height; y += GRID_SIZE) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+    /* --- Líneas finas (subdivisión) --- */
+    ctx.strokeStyle = getCss("--grid");
+    ctx.lineWidth = 0.5;
+    for (let x = HALF; x < canvas.width; x += GRID_SIZE) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+    }
+    for (let y = HALF; y < canvas.height; y += GRID_SIZE) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+    }
+  }
+
+  /*
+    getCss(varName): lee el valor actual de una variable CSS del elemento :root.
+    Necesario porque CSS y JS tienen sistemas de color independientes.
+    Ejemplo: getCss("--gridBold") → "#d6def7"
+  */
+  function getCss(varName) {
+    return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  }
+
+
+  /*
+    ============================================================
+    ESTRUCTURA DE DATOS DEL GRAFO
+    ============================================================
+    El grafo se representa con dos arrays globales:
+
+    V[] — Array de vértices. Cada vértice es un objeto:
+      { id, x, y, color, layer }
+        id:    número entero único (autoincremental desde 1).
+        x, y:  posición en coordenadas matemáticas (múltiplos de 0.5).
+        color: índice 0-4 en el mapa COLORS (0=sin asignar).
+        layer: número de capa calculado por computeLayers() o null.
+
+    E[] — Array de aristas. Cada arista es un objeto:
+      { id, a, b, virtual }
+        id:      número entero único.
+        a, b:    IDs de los dos vértices extremos.
+        virtual: boolean — true si fue añadida por triangulación automática.
+
+    vid, eid — Contadores para generar IDs únicos. Se incrementan al añadir
+    elementos y se recalculan al importar JSON para evitar colisiones.
+    ============================================================
+  */
+  let V = [];   /* Array de vértices */
+  let E = [];   /* Array de aristas */
+  let vid = 1;  /* Próximo ID de vértice */
+  let eid = 1;  /* Próximo ID de arista */
+
+  /*
+    getVertexById(id): búsqueda lineal en V[] por ID.
+    Devuelve el objeto vértice o undefined.
+  */
+  function getVertexById(id) { return V.find(v => v.id === id); }
+
+  /*
+    edgeKey(a, b): genera una clave canónica para identificar una arista
+    sin importar el orden de sus extremos.
+    Siempre pone primero el menor ID: edgeKey(5,2) === edgeKey(2,5) === "2-5".
+    Esto evita duplicados en hasEdge().
+  */
+  function edgeKey(a, b) { return a < b ? `${a}-${b}` : `${b}-${a}`; }
+
+  /*
+    hasEdge(a, b): verifica si existe una arista entre los vértices a y b.
+    Usa edgeKey() para la comparación bidireccional.
+  */
+  function hasEdge(a, b) {
+    const k = edgeKey(a, b);
+    return E.some(e => edgeKey(e.a, e.b) === k);
+  }
+
+
+  /*
+    ============================================================
+    GEOMETRÍA: INTERSECCIÓN DE SEGMENTOS
+    ============================================================
+    segmentsIntersect(p1, p2, p3, p4):
+    Determina si el segmento (p1,p2) intersecta con el segmento (p3,p4).
+    Cada punto es un objeto {x, y} en coordenadas matemáticas.
+
+    ALGORITMO:
+    Se basa en las orientaciones (producto vectorial) de las ternas de puntos.
+    Una orientación positiva indica giro antihorario, negativa indica horario,
+    y cero indica colinealidad.
+
+    La función interna orient(a,b,c) calcula:
+      (b.x-a.x)*(c.y-a.y) - (b.y-a.y)*(c.x-a.x)
+    Que es el doble del área del triángulo (a,b,c) con signo.
+
+    CASOS:
+      1. Si o1*o2 < 0 Y o3*o4 < 0 → los segmentos se cruzan propiamente.
+      2. Si algún orientación es ≈0 → punto colineal, se verifica con onSeg().
+
+    eps=1e-9 es la tolerancia numérica para casos degenerados (puntos colineales).
+    ============================================================
+  */
+  function segmentsIntersect(p1, p2, p3, p4) {
+    const eps = 1e-9;
+
+    /*
+      orient(a,b,c): producto vectorial de (b-a) × (c-a).
+      Resultado > 0: giro antihorario (CCW).
+      Resultado < 0: giro horario (CW).
+      Resultado ≈ 0: los tres puntos son colineales.
+    */
+    function orient(a, b, c) {
+      return (b.x-a.x)*(c.y-a.y) - (b.y-a.y)*(c.x-a.x);
+    }
+
+    /*
+      onSeg(a, b, c): verifica si el punto c está sobre el segmento (a,b).
+      Solo se llama cuando se sabe que a, b, c son colineales.
+      Comprueba que c está dentro de la bounding box del segmento.
+    */
+    function onSeg(a, b, c) {
+      return Math.min(a.x,b.x)-eps <= c.x && c.x <= Math.max(a.x,b.x)+eps &&
+             Math.min(a.y,b.y)-eps <= c.y && c.y <= Math.max(a.y,b.y)+eps;
+    }
+
+    /* Calcular las cuatro orientaciones necesarias */
+    const o1 = orient(p1,p2,p3);
+    const o2 = orient(p1,p2,p4);
+    const o3 = orient(p3,p4,p1);
+    const o4 = orient(p3,p4,p2);
+
+    /* Caso general: los puntos se separan por la otra arista */
+    if ((o1*o2 < -eps) && (o3*o4 < -eps)) return true;
+
+    /* Casos degenerados: puntos colineales sobre el segmento */
+    if (Math.abs(o1) <= eps && onSeg(p1,p2,p3)) return true;
+    if (Math.abs(o2) <= eps && onSeg(p1,p2,p4)) return true;
+    if (Math.abs(o3) <= eps && onSeg(p3,p4,p1)) return true;
+    if (Math.abs(o4) <= eps && onSeg(p3,p4,p2)) return true;
+
+    return false;
+  }
+
+  /*
+    wouldCross(aId, bId):
+    Comprueba si añadir una arista entre los vértices aId y bId
+    cruzaría alguna arista EXISTENTE en el grafo.
+
+    Esta es la función de guardián de la planaridad:
+    se llama antes de cada addEdge() para asegurar que el grafo
+    se mantiene planar en el dibujo dado.
+
+    Itera sobre todas las aristas E y salta las que comparten
+    un extremo con la nueva arista (comparten un vértice → no puede haber cruce propio).
+  */
+  function wouldCross(aId, bId) {
+    const a = getVertexById(aId), b = getVertexById(bId);
+    const p1 = {x:a.x, y:a.y}, p2 = {x:b.x, y:b.y};
+    for (const e of E) {
+      /* Saltar aristas que compartan un extremo con la nueva arista */
+      if (e.a===aId || e.b===aId || e.a===bId || e.b===bId) continue;
+      const u = getVertexById(e.a), v = getVertexById(e.b);
+      if (segmentsIntersect(p1, p2, {x:u.x,y:u.y}, {x:v.x,y:v.y})) return true;
+    }
+    return false;
+  }
+
+  /*
+    addVertex(x, y):
+    Crea un nuevo vértice en las coordenadas matemáticas (x, y).
+    El vértice se inicializa con:
+      color=0 (sin asignar, gris)
+      layer=null (sin capa calculada aún)
+    Incrementa el contador vid para el próximo ID.
+    Registra el evento en el log y redibuja.
+  */
+  function addVertex(x, y) {
+    const v = {id:vid++, x, y, color:0, layer:null};
+    V.push(v);
+    log("INFO", `Añadido v${v.id} en (${x},${y}).`);
+    draw();
+  }
+
+  /*
+    addEdge(aId, bId, virtual=false):
+    Intenta añadir una arista entre los vértices con IDs aId y bId.
+
+    Validaciones en orden:
+      1. No puede ser un auto-bucle (aId === bId).
+      2. La arista no puede existir ya (hasEdge).
+      3. La arista no puede cruzar otras aristas (wouldCross).
+
+    Si pasa todas las validaciones, crea la arista y redibuja.
+    Devuelve true si se añadió con éxito, false si fue rechazada.
+
+    El parámetro virtual=true se usa en triangulateWithVirtualEdges()
+    para marcar las aristas añadidas automáticamente.
+  */
+  function addEdge(aId, bId, virtual=false) {
+    if (aId === bId) return false;            /* Auto-bucle: rechazar */
+    if (hasEdge(aId, bId)) return false;      /* Duplicada: rechazar */
+    if (wouldCross(aId, bId)) return false;   /* Cruce: rechazar (mantiene planaridad) */
+    E.push({id:eid++, a:aId, b:bId, virtual});
+    log("INFO", `Añadida arista ${virtual?'(virtual) ':''}(${aId},${bId}).`);
+    draw();
+    return true;
+  }
+
+  /*
+    hitVertexCoord(cx, cy):
+    Busca si existe un vértice "cerca" de las coordenadas (cx, cy).
+    La distancia se calcula en coordenadas (no en píxeles).
+    Umbral: d² < 0.12 (equivale a ≈ 0.35 unidades de radio de captura,
+    que con GRID_SIZE=40 corresponde a unos 14px en pantalla).
+    Devuelve el vértice más cercano dentro del umbral, o null.
+  */
+  function hitVertexCoord(cx, cy) {
+    let best = null, bestD = 1e9;
+    for (const v of V) {
+      const dx = v.x-cx, dy = v.y-cy;
+      const d = dx*dx + dy*dy;
+      if (d < 0.12 && d < bestD) { best=v; bestD=d; }
+    }
+    return best;
+  }
+
+  /*
+    hitEdgeAtPx(px, py, tolPx):
+    Detecta si el punto (px, py) EN PÍXELES está sobre alguna arista.
+    Trabaja en espacio de píxeles para mayor precisión visual.
+
+    Usa la función interna distPointSeg() que calcula la distancia mínima
+    de un punto a un segmento usando proyección vectorial:
+      - Si la proyección cae antes del inicio → distancia al punto inicial.
+      - Si la proyección cae después del final → distancia al punto final.
+      - Si cae en el interior → distancia al punto proyectado.
+
+    Parámetros:
+      px, py:  coordenadas del clic en píxeles del canvas.
+      tolPx:   tolerancia en píxeles (se usa 8px en el código).
+
+    Devuelve el ID de la arista más cercana dentro de la tolerancia, o null.
+  */
+  function hitEdgeAtPx(px, py, tolPx) {
+    let bestId = null, bestD = 1e9;
+
+    /*
+      distPointSeg: distancia de un punto (px,py) al segmento (x1,y1)-(x2,y2).
+      c1 = proyección escalar del vector punto→inicio sobre el vector del segmento.
+      c2 = longitud al cuadrado del segmento.
+      t = parámetro de la proyección (clampado entre 0 y 1).
+    */
+    function distPointSeg(px, py, x1, y1, x2, y2) {
+      const vx=x2-x1, vy=y2-y1;
+      const wx=px-x1, wy=py-y1;
+      const c1 = vx*wx + vy*wy;
+      if (c1 <= 0) return Math.hypot(px-x1, py-y1); /* antes del inicio */
+      const c2 = vx*vx + vy*vy;
+      if (c2 <= c1) return Math.hypot(px-x2, py-y2); /* después del final */
+      const t = c1 / c2;
+      const projx = x1 + t*vx, projy = y1 + t*vy;   /* punto proyectado */
+      return Math.hypot(px-projx, py-projy);
+    }
+
+    for (const e of E) {
+      const a = getVertexById(e.a), b = getVertexById(e.b);
+      if (!a || !b) continue;
+      /* Convertir las coordenadas del vértice a píxeles para la comparación */
+      const x1 = coordToPxX(a.x), y1 = coordToPxY(a.y);
+      const x2 = coordToPxX(b.x), y2 = coordToPxY(b.y);
+      const d = distPointSeg(px, py, x1, y1, x2, y2);
+      if (d <= tolPx && d < bestD) { bestD=d; bestId=e.id; }
+    }
+    return bestId;
+  }
+
+
+  /*
+    ============================================================
+    FUNCIÓN PRINCIPAL DE RENDERIZADO: draw()
+    ============================================================
+    Renderiza completamente el canvas en cada frame.
+    Se llama después de cualquier modificación al grafo o estado de la UI.
+
+    Orden de renderizado (de atrás hacia adelante):
+      1. Limpiar canvas.
+      2. Dibujar grid de fondo.
+      3. Dibujar aristas (reales y virtuales).
+      4. Dibujar vértices (círculos con ID y capa).
+      5. Actualizar textos de estado en la UI (editStatus, stats, jsonMeta).
+    ============================================================
+  */
+  function draw() {
+    /* 1. Limpiar todo el canvas */
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    /* 2. Dibujar la cuadrícula de fondo */
+    drawGrid();
+
+    /* 3. Dibujar aristas */
+    ctx.save(); /* guardar estado del contexto para no afectar el renderizado de vértices */
+    ctx.lineWidth = 2;
+    for (const e of E) {
+      /* Si la arista es virtual y el checkbox está desmarcado, omitirla */
+      if (e.virtual && !showVirtual) continue;
+      const a = getVertexById(e.a), b = getVertexById(e.b);
+      if (!a || !b) continue; /* arista huérfana (no debería ocurrir) */
+
+      /*
+        Estilo visual de la arista:
+          - Reales: negro semiopaco, línea continua.
+          - Virtuales (triangulación): azul claro muy transparente, línea punteada [6,6].
+      */
+      ctx.strokeStyle = e.virtual ? "rgba(14,165,233,.35)" : "rgba(15,23,42,.55)";
+      ctx.setLineDash(e.virtual ? [6,6] : []);
+      ctx.beginPath();
+      ctx.moveTo(coordToPxX(a.x), coordToPxY(a.y));
+      ctx.lineTo(coordToPxX(b.x), coordToPxY(b.y));
+      ctx.stroke();
+    }
+    ctx.restore(); /* restaurar estado (línea sólida, sin dash) */
+
+    /* 4. Dibujar vértices */
+    for (const v of V) {
+      const px = coordToPxX(v.x), py = coordToPxY(v.y);
+      const r = 12; /* radio del círculo en píxeles */
+
+      /* Círculo relleno con el color asignado (COLORS[0] = gris si no asignado) */
+      ctx.beginPath();
+      ctx.fillStyle = COLORS[v.color || 0];
+      ctx.arc(px, py, r, 0, Math.PI*2);
+      ctx.fill();
+
+      /* Borde del círculo:
+           - Naranja vivo: si es el primer vértice seleccionado en modo arista (edgePick).
+           - Negro translúcido: estado normal. */
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = (edgePick === v.id) ? "rgba(245,158,11,.95)" : "rgba(15,23,42,.25)";
+      ctx.stroke();
+
+      /* Número de ID del vértice centrado dentro del círculo */
+      ctx.fillStyle = "#0f172a";
+      ctx.font = "12px ui-monospace, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(v.id), px, py);
+
+      /* Si el vértice tiene capa asignada, mostrarla debajo del círculo como "L1", "L2"... */
+      if (v.layer != null) {
+        ctx.font = "10px ui-monospace, monospace";
+        ctx.fillStyle = "rgba(91,107,138,.95)";
+        ctx.fillText("L" + v.layer, px, py+18);
+      }
+    }
+
+    /* 5. Actualizar textos de estado en la UI */
+
+    /* editStatus: instrucciones contextuales según el modo activo */
+    $("editStatus").textContent = (mode === "vertex")
+      ? "Click=crear • Arrastrar=mover"
+      : (mode === "edge")
+        ? (edgePick ? `Selecciona 2do vértice (primero v${edgePick})` : "Click en 2 vértices")
+        : "Click en vértice o arista para borrar";
+
+    /* stats: cardinalidades del grafo actual */
+    $("stats").textContent = `|V|=${V.length}  |E|=${E.length}`;
+
+    /* jsonMeta: tip permanente sobre el flujo de trabajo */
+    $("jsonMeta").textContent = `TIP: Exporta y carga archivos JSON creados en este editar para usarlos posteriormente.`;
+  }
+
+
+  /*
+    ============================================================
+    VARIABLES DE ESTADO DEL EDITOR INTERACTIVO
+    ============================================================
+  */
+
+  /* Modo de edición actual: "vertex" | "edge" | "delete" */
+  let mode = "vertex";
+
+  /* Si true, las aristas virtuales (punteadas) son visibles en el canvas */
+  let showVirtual = true;
+
+  /* ID del vértice que está siendo arrastrado con el ratón, o null */
+  let dragging = null;
+
+  /* ID del primer vértice seleccionado al crear una arista (modo edge), o null */
+  let edgePick = null;
+
+
+  /*
+    canvasToLocal(ev):
+    Convierte las coordenadas del evento de ratón (relativas a la ventana)
+    a coordenadas relativas al canvas (en píxeles del canvas).
+    Usa getBoundingClientRect() para obtener la posición del canvas en la página.
+    No necesita ajustar por el scroll del canvasWrap porque getBoundingClientRect
+    ya tiene en cuenta el scroll y devuelve la posición visible.
+  */
+  function canvasToLocal(ev) {
+    const r = canvas.getBoundingClientRect();
+    const x = ev.clientX - r.left;
+    const y = ev.clientY - r.top;
+    return {x, y};
+  }
+
+  /*
+    toCoordFromEvent(ev):
+    Pipeline completo de conversión de un evento de ratón a coordenadas matemáticas:
+      1. Obtiene la posición en píxeles del canvas con canvasToLocal().
+      2. Aplica snap a la subdivisión del grid con snapToHalf().
+      3. Convierte los píxeles snapeados a coordenadas matemáticas.
+
+    Devuelve {cx, cy, px, py}:
+      cx, cy: coordenadas matemáticas (usadas para crear vértices y hit-test).
+      px, py: píxeles snapeados (usados para hit-test de aristas en espacio pixel).
+  */
+  function toCoordFromEvent(ev) {
+    const p = canvasToLocal(ev);
+    const s = snapToHalf(p.x, p.y);
+    const cx = pxToCoordX(s.x);
+    const cy = pxToCoordY(s.y);
+    return {cx, cy, px:s.x, py:s.y};
+  }
+
+
+  /*
+    ============================================================
+    EVENTOS DE RATÓN EN EL CANVAS
+    ============================================================
+  */
+
+  /*
+    mousedown: maneja el clic según el modo activo.
+    Flujo por modo:
+
+    MODO "vertex":
+      - Si hay un vértice bajo el cursor: inicia drag (guarda su ID en dragging).
+      - Si no hay vértice: crea uno nuevo en la posición snapeada.
+
+    MODO "edge":
+      - Solo actúa si el clic es sobre un vértice existente.
+      - Primer clic: guarda el vértice en edgePick (se pinta con borde naranja).
+      - Segundo clic:
+          * Si mismo vértice → ignorar (no se crea auto-bucle).
+          * Si distinto → intentar addEdge(). Si falla, logear el error.
+          * Limpiar edgePick en ambos casos.
+
+    MODO "delete":
+      - Si hay vértice bajo el cursor: eliminarlo de V[] y todas sus aristas de E[].
+      - Si no hay vértice pero hay arista dentro de 8px: eliminar esa arista.
+      - En ambos casos, llama resetSearchUI(true) para invalidar la búsqueda activa
+        (el grafo cambió, la búsqueda ya no es válida).
+  */
+  canvas.addEventListener("mousedown", (ev) => {
+    const {cx, cy, px, py} = toCoordFromEvent(ev);
+    const hv = hitVertexCoord(cx, cy); /* vértice bajo el cursor (o null) */
+
+    if (mode === "vertex") {
+      if (hv) dragging = hv.id; /* iniciar arrastre */
+      else    addVertex(cx, cy); /* crear vértice */
+      return;
+    }
+
+    if (mode === "edge") {
+      if (!hv) return; /* solo actúa sobre vértices */
+      if (!edgePick) {
+        edgePick = hv.id; /* primer vértice seleccionado */
+        draw();           /* redibuja con borde naranja en edgePick */
+      } else {
+        const a = edgePick, b = hv.id;
+        if (a !== b) {
+          /* Intentar crear la arista; si falla (cruce o duplicada), loguear */
+          if (!addEdge(a, b, false))
+            log("FAIL", `No se pudo agregar arista (${a},${b}). (¿Cruce o duplicada?)`);
+        }
+        edgePick = null; /* limpiar selección siempre */
+        draw();
+      }
+      return;
+    }
+
+    /* MODO "delete" */
+    if (mode === "delete") {
+      if (hv) {
+        const id = hv.id;
+        /* Eliminar todas las aristas incidentes al vértice */
+        E = E.filter(e => e.a !== id && e.b !== id);
+        /* Eliminar el vértice */
+        V = V.filter(v => v.id !== id);
+        /* Limpiar referencias colgantes */
+        if (edgePick === id) edgePick = null;
+        dragging = null;
+        resetSearchUI(true); /* invalidar búsqueda activa */
+        log("OK", `Borrado vértice v${id} (y aristas incidentes).`);
+        draw();
+        return;
+      }
+      /* Si no se hizo clic sobre un vértice, intentar sobre una arista (tolerancia 8px) */
+      const hitId = hitEdgeAtPx(px, py, 8);
+      if (hitId != null) {
+        const e = E.find(x => x.id === hitId);
+        E = E.filter(x => x.id !== hitId);
+        resetSearchUI(true);
+        log("OK", `Borrada arista (${e.a},${e.b})${e.virtual?' (virtual)':''}.`);
+        draw();
+      }
+      return;
+    }
+  });
+
+  /*
+    mousemove: gestiona el arrastre de vértices.
+
+    Cuando dragging tiene un ID (se inició un drag en mousedown):
+      1. Obtiene la nueva posición snapeada del cursor.
+      2. Guarda la posición anterior por si hay que revertir.
+      3. Actualiza (v.x, v.y) provisoriamente.
+      4. VALIDACIÓN DE PLANARIDAD DURANTE EL DRAG:
+         Para cada arista incidente al vértice movido, verifica que
+         no cruce ninguna arista no incidente. Si hay cruce, revierte.
+      5. Redibuja en cualquier caso.
+
+    Este sistema garantiza que el grafo sigue siendo planar incluso
+    durante el movimiento interactivo de vértices.
+  */
+  canvas.addEventListener("mousemove", (ev) => {
+    if (!dragging) return; /* solo actúa si hay drag activo */
+    const {cx, cy} = toCoordFromEvent(ev);
+    const v = getVertexById(dragging);
+    if (!v) return;
+
+    const old = {x:v.x, y:v.y}; /* guardar posición para posible reversión */
+    v.x = cx; v.y = cy;         /* mover vértice provisionalmente */
+
+    /* Validar que ninguna arista incidente cruza otras aristas */
+    let ok = true;
+    for (const e of E) {
+      /* Solo procesar aristas que involucran al vértice movido */
+      if (e.a !== v.id && e.b !== v.id) continue;
+      const a = getVertexById(e.a), b = getVertexById(e.b);
+      const p1 = {x:a.x, y:a.y}, p2 = {x:b.x, y:b.y};
+      for (const f of E) {
+        if (f.id === e.id) continue; /* no comparar consigo misma */
+        /* Saltar aristas que compartan un extremo (no puede haber cruce propio) */
+        if (f.a===e.a || f.b===e.a || f.a===e.b || f.b===e.b) continue;
+        const u = getVertexById(f.a), w = getVertexById(f.b);
+        if (segmentsIntersect(p1, p2, {x:u.x,y:u.y}, {x:w.x,y:w.y})) {
+          ok = false; break;
+        }
+      }
+      if (!ok) break;
+    }
+
+    /* Si hay cruce, revertir el movimiento */
+    if (!ok) { v.x = old.x; v.y = old.y; }
+
+    draw();
+  });
+
+  /* mouseup: terminar el arrastre, independientemente de dónde suelte el ratón */
+  window.addEventListener("mouseup", () => { dragging = null; });
+
+
+  /*
+    ============================================================
+    BOTONES DE MODO Y CONTROLES DEL EDITOR
+    ============================================================
+  */
+
+  /* Cambio de modo: siempre limpiar edgePick al cambiar para evitar aristas colgantes */
+  $("modeVertex").onclick = () => { mode="vertex"; edgePick=null; draw(); };
+  $("modeEdge").onclick   = () => { mode="edge";   edgePick=null; draw(); };
+  $("modeDelete").onclick = () => { mode="delete"; edgePick=null; draw(); };
+
+  /*
+    Checkbox de aristas virtuales:
+    Cambia la variable showVirtual según el estado del checkbox.
+    !! (doble negación) convierte el valor a boolean estricto.
+  */
+  $("toggleVirtual").addEventListener("change", (ev) => {
+    showVirtual = !!ev.target.checked;
+    draw();
+  });
+
+  /*
+    Botón "Borrar grafo":
+    Reinicia completamente el estado del editor:
+      - Vacía V[] y E[].
+      - Resetea los contadores de ID a 1.
+      - Limpia edgePick y dragging.
+      - Invalida cualquier búsqueda activa.
+      - Redibuja el canvas vacío.
+  */
+  $("clearGraph").onclick = () => {
+    V=[]; E=[]; vid=1; eid=1;
+    edgePick=null; dragging=null;
+    resetSearchUI(true);
+    log("OK", "Grafo borrado.");
+    draw();
+  };
+
+
+  /*
+    ============================================================
+    IMPORTACIÓN Y EXPORTACIÓN JSON
+    ============================================================
+    Permiten guardar el estado del grafo en disco y restaurarlo
+    en sesiones futuras. El formato JSON guarda:
+      - vertices: array de {id, x, y, color, layer}
+      - edges: array de {id, a, b, virtual}
+      - meta: {gridW, gridH, gridSize} — información del grid
+    ============================================================
+  */
+
+  /*
+    exportJSON():
+    Serializa el grafo actual y lo descarga como archivo JSON.
+
+    Proceso:
+      1. Construye el objeto JSON con V, E y meta.
+      2. Crea un Blob (objeto binario) con el JSON formateado.
+      3. Genera una URL temporal para el Blob con URL.createObjectURL().
+      4. Crea un elemento <a> invisible, le asigna la URL y simula un clic.
+      5. Elimina el <a> y libera la URL para evitar fugas de memoria.
+  */
+  function exportJSON() {
+    const obj = {
+      vertices: V.map(v => ({id:v.id, x:v.x, y:v.y, color:v.color||0, layer:v.layer})),
+      edges:    E.map(e => ({id:e.id, a:e.a, b:e.b, virtual:!!e.virtual})),
+      meta:     {gridW, gridH, gridSize: GRID_SIZE}
+    };
+    const blob = new Blob([JSON.stringify(obj, null, 2)], {type:"application/json"});
+    const url  = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "grafo_planar.json";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url); /* liberar memoria */
+    $("jsonMeta").textContent = `Último: exportado`;
+    log("OK", "JSON exportado a archivo.");
+  }
+  $("exportBtn").onclick = exportJSON;
+
+  /* "Importar JSON" dispara el selector de archivos del sistema */
+  $("importBtn").onclick = () => $("fileInput").click();
+
+  /*
+    Evento "change" del input de archivo:
+    Se dispara cuando el usuario selecciona un archivo JSON.
+
+    Proceso async:
+      1. Lee el archivo con file.text() (API moderna de File, devuelve Promise).
+      2. Parsea el JSON.
+      3. Valida que tenga "vertices" y "edges".
+      4. Reconstruye V[] y E[] con conversión de tipos (+ operador fuerza number).
+      5. Recalcula vid/eid como max(IDs)+1 para evitar colisiones.
+      6. Limpia estado de edición y búsqueda.
+      7. En el bloque finally: resetea el valor del input para permitir
+         importar el mismo archivo de nuevo (sin este reset, el evento change
+         no se dispararía si el archivo es idéntico al anterior).
+  */
+  $("fileInput").addEventListener("change", async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const obj  = JSON.parse(text);
+      if (!obj.vertices || !obj.edges) throw new Error("JSON inválido: faltan vertices/edges.");
+
+      /* Reconstruir V[] con coerción de tipos (+v.id fuerza a número) */
+      V = obj.vertices.map(v => ({
+        id:    +v.id,
+        x:     +v.x,
+        y:     +v.y,
+        color: +(v.color||0),
+        layer: (v.layer==null ? null : +v.layer)
+      }));
+
+      /* Reconstruir E[] — si la arista no tiene ID en el JSON, usa eid++ */
+      E = obj.edges.map(e => ({
+        id:      +(e.id || eid++),
+        a:       +e.a,
+        b:       +e.b,
+        virtual: !!e.virtual
+      }));
+
+      /* Recalcular contadores para no colisionar con IDs importados */
+      vid = Math.max(1, ...V.map(v => v.id)) + 1;
+      eid = Math.max(1, ...E.map(e => e.id)) + 1;
+
+      edgePick = null; dragging = null;
+      resetSearchUI(true);
+      $("jsonMeta").textContent = `Último: importado (${file.name})`;
+      log("OK", `JSON importado (${file.name}).`);
+      draw();
+    } catch(err) {
+      log("FAIL", "Error al importar: " + err.message);
+    } finally {
+      ev.target.value = ""; /* resetear para permitir reimportar el mismo archivo */
+    }
+  });
+
+
+  /*
+    ============================================================
+    SISTEMA DE CAPAS (LAYERS)
+    ============================================================
+    Las "capas" son una descomposición jerárquica del grafo planar
+    que organiza los vértices por su distancia topológica al borde.
+
+    CONCEPTO:
+    La "capa 1" es la cara exterior del grafo (la frontera más externa).
+    Después de eliminar esos vértices, la nueva cara exterior forma la "capa 2".
+    Y así sucesivamente hasta agotar todos los vértices.
+
+    Esto crea un orden natural de "adentro hacia afuera" que el algoritmo
+    de coloreo usa para expandir el coloreo desde el núcleo central.
+    ============================================================
+  */
+
+  /*
+    buildAdj(activeSet=null):
+    Construye el grafo como un mapa de adyacencia:
+      Map<vertexId, [neighborId1, neighborId2, ...]>
+
+    Si se pasa activeSet (un iterable de IDs), solo incluye los vértices
+    e incidentes del subconjunto. Esto permite calcular la adyacencia
+    de subgrafos inducidos, necesario para computeLayers().
+
+    Resultado: Map donde cada ID de vértice mapea a un array de sus vecinos.
+  */
+  function buildAdj(activeSet=null) {
+    const active = activeSet ? new Set(activeSet) : null;
+    const adj = new Map();
+
+    /* Inicializar con arrays vacíos para cada vértice activo */
+    for (const v of V) {
+      if (active && !active.has(v.id)) continue;
+      adj.set(v.id, []);
+    }
+
+    /* Añadir los vecinos para cada arista (no dirigida: se añade en ambas direcciones) */
+    for (const e of E) {
+      if (active && (!active.has(e.a) || !active.has(e.b))) continue;
+      if (!adj.has(e.a) || !adj.has(e.b)) continue;
+      adj.get(e.a).push(e.b);
+      adj.get(e.b).push(e.a);
+    }
+    return adj;
+  }
+
+  /*
+    facesFromEmbedding(activeVertexSet=null):
+    Detecta todas las caras del grafo planar usando el embedding
+    definido por las posiciones 2D de los vértices.
+
+    ALGORITMO (Half-Edge / Next-Left):
+    Un grafo planar embebido tiene una dualidad entre aristas dirigidas y caras.
+    Para cada arista dirigida (u→v), la cara "a la izquierda" se obtiene
+    siguiendo el "siguiente giro" alrededor del vértice v.
+
+    Implementación:
+      1. Para cada vértice u, ordenar sus vecinos por ángulo (Math.atan2) de menor a mayor.
+         Esto da el orden circular de las aristas alrededor de cada vértice.
+      2. "nextLeft(u, v)": dado que llegamos a v viniendo de u, el siguiente paso
+         en la cara a la izquierda es el vecino anterior (índice -1) en el orden angular de v.
+      3. Iterar sobre todas las aristas dirigidas no visitadas, siguiendo nextLeft()
+         hasta cerrar el ciclo → cada ciclo es una cara.
+      4. Calcular el área con signo (fórmula de Gauss) para cada cara:
+         área positiva → cara interior (orden CCW).
+         área negativa → cara exterior (orden CW, la "cara infinita").
+      5. Deduplicar caras equivalentes por rotación y reflexión del ciclo.
+
+    Devuelve array de {cycle: [id1,id2,...], area: número}.
+  */
+  function facesFromEmbedding(activeVertexSet=null) {
+    const adj = buildAdj(activeVertexSet);
+
+    /*
+      Para cada vértice u, calcular el orden circular de sus vecinos
+      ordenando por ángulo polar (Math.atan2) desde la posición de u.
+      Esto replica el orden que tendrían las aristas en el plano.
+    */
+    const order = new Map();
+    for (const [u, ns] of adj.entries()) {
+      const vu = getVertexById(u);
+      const arr = ns.map(v => {
+        const vv = getVertexById(v);
+        return {to:v, ang: Math.atan2(vv.y-vu.y, vv.x-vu.x)};
+      }).sort((a,b) => a.ang-b.ang);
+      order.set(u, arr);
+    }
+
+    /* Conjunto de aristas dirigidas ya visitadas (cada arista genera 2: u→v y v→u) */
+    const visited = new Set();
+    const faces   = [];
+    const key     = (u, v) => u + "->" + v; /* clave única para arista dirigida */
+
+    /*
+      nextLeft(u, v): operación central del algoritmo.
+      Dado que estamos en v llegando desde u, calcula el siguiente paso
+      en la cara a la izquierda de la arista (u→v).
+
+      En el orden circular de vecinos de v, u está en cierta posición.
+      El "siguiente a la izquierda" es el vecino ANTERIOR en el orden angular
+      (índice -1 módulo longitud), que es el más cercano en sentido horario.
+    */
+    function nextLeft(u, v) {
+      const arr = order.get(v);
+      if (!arr || !arr.length) return null;
+      const idx  = arr.findIndex(x => x.to === u);
+      if (idx < 0) return null;
+      const prev = (idx - 1 + arr.length) % arr.length; /* índice anterior (circular) */
+      return {u:v, v:arr[prev].to};
+    }
+
+    /* Iterar sobre todas las aristas dirigidas para encontrar todas las caras */
+    for (const [u, ns] of adj.entries()) {
+      for (const v of ns) {
+        if (visited.has(key(u, v))) continue; /* ya procesada esta arista dirigida */
+
+        const poly = [];
+        let cu = u, cv = v;
+        let safety = 0; /* límite de iteraciones para evitar bucles infinitos */
+
+        while (safety++ < 10000) {
+          visited.add(key(cu, cv));
+          poly.push(cu);
+          const nxt = nextLeft(cu, cv);
+          if (!nxt) break;
+          cu = nxt.u; cv = nxt.v;
+          if (cu===u && cv===v) break; /* ciclo completado */
+        }
+
+        /* Solo caras con ≥ 3 vértices (triángulo o más) */
+        if (poly.length >= 3) {
+          /* Calcular área con signo usando la fórmula de la Cuadrícula de Gauss:
+             área = (1/2) * Σ(x_i * y_{i+1} - x_{i+1} * y_i)
+             CCW → área > 0 (cara interior)
+             CW  → área < 0 (cara exterior / cara infinita) */
+          let area = 0;
+          for (let i = 0; i < poly.length; i++) {
+            const a = getVertexById(poly[i]);
+            const b = getVertexById(poly[(i+1) % poly.length]);
+            area += a.x*b.y - a.y*b.x;
+          }
+          area /= 2;
+          faces.push({cycle:poly, area});
+        }
+      }
+    }
+
+    /*
+      Deduplicar caras: una misma cara puede aparecer en ambas orientaciones
+      (u→v→w y w→v→u son la misma cara vista desde lados opuestos).
+      La canonicalización usa la rotación mínima del ciclo y su reversa,
+      tomando el lexicográficamente menor como clave.
+    */
+    const uniq = [], seen = new Set();
+    for (const f of faces) {
+      const c    = f.cycle.slice();
+      const min  = Math.min(...c);
+      const i    = c.indexOf(min);
+      const norm = c.slice(i).concat(c.slice(0,i)).join(","); /* rotación canónica */
+      const rev  = c.slice().reverse();
+      const min2 = Math.min(...rev);
+      const j    = rev.indexOf(min2);
+      const norm2 = rev.slice(j).concat(rev.slice(0,j)).join(","); /* reversa canónica */
+      const k = norm < norm2 ? norm : norm2; /* tomar la menor de las dos */
+      if (!seen.has(k)) { seen.add(k); uniq.push(f); }
+    }
+    return uniq;
+  }
+
+  /*
+    computeLayers():
+    Calcula la capa (layer) de cada vértice mediante eliminación iterativa
+    de la cara exterior (algoritmo de "peeling" de capas).
+
+    ALGORITMO:
+      Mientras haya ≥ 3 vértices en el subconjunto "remaining":
+        1. Calcular las caras del subgrafo inducido por remaining.
+        2. Identificar la cara exterior (la de mayor |área|).
+        3. Los vértices del ciclo de la cara exterior forman la "capa k".
+        4. Asignar v.layer = k a todos esos vértices.
+        5. Eliminar esos vértices de remaining.
+        6. Incrementar k y repetir.
+
+    Resultado: v.layer = 1 para los vértices más externos (borde del grafo),
+    v.layer = k_max para los más internos (núcleo).
+
+    El algoritmo de coloreo usa esta información para procesar los vértices
+    desde el interior (núcleo, mayor layer) hacia el exterior.
+
+    Precondición: verifica que no haya cruces entre aristas, lo que indicaría
+    que el grafo no es planar o que el dibujo es incorrecto.
+  */
+
+function computeLayers(){
+    if (V.length<3){ log("FAIL","Necesitas al menos 3 vértices."); return null; }
+    // crossing check
+    for (let i=0;i<E.length;i++){
+      for (let j=i+1;j<E.length;j++){
+        const e=E[i], f=E[j];
+        if (e.a===f.a||e.a===f.b||e.b===f.a||e.b===f.b) continue;
+        const a=getVertexById(e.a), b=getVertexById(e.b), c=getVertexById(f.a), d=getVertexById(f.b);
+        if (segmentsIntersect({x:a.x,y:a.y},{x:b.x,y:b.y},{x:c.x,y:c.y},{x:d.x,y:d.y})){
+          log("FAIL","No se pueden calcular layers: hay cruces en el dibujo.");
+          return null;
+        }
+      }
+    }
+    const remaining=new Set(V.map(v=>v.id));
+    const layers=[];
+    let iter=0;
+    while (remaining.size>=3 && iter++<1000){
+      const faces=facesFromEmbedding([...remaining]);
+      if (!faces.length){ log("FAIL","No se detectaron caras (embedding inválido o grafo no 2-conexo)."); break; }
+      let outer=faces[0];
+      for (const f of faces) if (Math.abs(f.area)>Math.abs(outer.area)) outer=f;
+      const layerVerts=[...new Set(outer.cycle)].filter(id=>remaining.has(id));
+      if (!layerVerts.length) break;
+      layers.push(layerVerts);
+      for (const id of layerVerts) remaining.delete(id);
+      if (!remaining.size) break;
+    }
+
+    // FIX: vértices sobrantes (1 o 2) que no formaron cara propia
+    if (remaining.size > 0){
+      const leftover=[...remaining];
+      layers.push(leftover);
+      log("INFO",`${leftover.length} vértice(s) sin cara propia (v${leftover.join(", v")}) → Layer ${layers.length} asignado.`);
+    }
+
+    V.forEach(v=>v.layer=null);
+    layers.forEach((arr,idx)=>{
+      for (const id of arr){
+        const v=getVertexById(id);
+        if (v) v.layer=idx+1;
+      }
+    });
+    log("OK",`Layers calculados: ${layers.length}.`);
+    draw();
+    return layers;
+  }
+
+  /* El botón "Calcular Layers" ejecuta computeLayers() de forma aislada */
+  $("layersBtn").onclick = computeLayers;
+
+
+  /*
+    ============================================================
+    ÁRBOL DE BÚSQUEDA SVG
+    ============================================================
+    Módulo encapsulado mediante IIFE que gestiona completamente el SVG
+    del árbol de búsqueda (panel B1).
+
+    El árbol refleja en tiempo real el proceso del DFS:
+      - Cada nodo del árbol corresponde a un estado del DFS.
+      - Los nodos se añaden uno a uno conforme avanza el algoritmo.
+      - El color del nodo indica su estado: vivo/podado/fallo/éxito.
+      - Hacer clic en un nodo restaura el coloreo del grafo a ese estado.
+
+    El módulo expone una API pública mínima:
+      reset()          — vaciar el árbol.
+      addNode(params)  — añadir un nodo y redibujar.
+      updateStatus()   — actualizar el estado de un nodo existente.
+      selectNode()     — seleccionar un nodo (click o programático).
+      centerSelected() — hacer scroll para centrar el nodo seleccionado.
+      getState()       — serializar el árbol completo (para historial).
+      setState()       — restaurar el árbol desde una serialización.
+    ============================================================
+  */
+  const tree = (() => {
+    /* Referencias al SVG y su contenedor scrollable */
+    const svg  = $("treeSvg");
+    const wrap = $("treeWrap");
+
+    /*
+      Parámetros de layout del árbol:
+        dx=170: separación horizontal entre nodos (en píxeles del SVG).
+        dy=60:  separación vertical entre niveles (profundidad).
+        r=10:   radio de cada círculo nodo.
+    */
+    const dx=170, dy=60, r=10;
+
+    /* Array interno de nodos del árbol:
+       Cada nodo: {id, parent, depth, status, label, xIndex}
+         id:      índice en el array (= nodes.length al momento de crear).
+         parent:  índice del nodo padre, o null para la raíz.
+         depth:   nivel de profundidad en el árbol (0=raíz).
+         status:  "live" | "ok" | "fail" | "prune".
+         label:   texto descriptivo (p.ej. "v5=2" o "ÉXITO ✅").
+         xIndex:  posición horizontal en el layout (columna del nodo).
+    */
+    let nodes    = [];
+    let selected = null; /* ID del nodo actualmente seleccionado */
+
+    /*
+      colorForStatus(st): devuelve el color CSS para cada estado.
+      Usa variables CSS para mantener consistencia con el tema de la app.
+    */
+    function colorForStatus(st) {
+      if (st === "ok")    return "var(--ok)";    /* verde */
+      if (st === "fail")  return "var(--bad)";   /* rojo */
+      if (st === "prune") return "var(--warn)";  /* naranja */
+      return "var(--accent)";                    /* azul (live o desconocido) */
+    }
+
+    /*
+      nodePos(n): calcula la posición SVG (x, y) de un nodo.
+      La posición depende de:
+        xIndex: columna del nodo (cuántos nodos hay a su izquierda en el mismo nivel).
+        depth:  fila del nodo (distancia a la raíz).
+      El offset de 50 es el margen izquierdo/superior del árbol.
+    */
+    function nodePos(n) {
+      return {x: 50 + n.xIndex*dx, y: 50 + n.depth*dy};
+    }
+
+    /*
+      render(): redibuja completamente el SVG del árbol.
+      Se llama en cualquier modificación del árbol (addNode, updateStatus, selectNode).
+
+      Proceso:
+        1. Limpiar el SVG (innerHTML = "").
+        2. Primer pasada: dibujar las aristas (líneas) entre nodo y padre.
+        3. Segunda pasada: dibujar los nodos (círculo + etiqueta) con click handlers.
+        4. Redimensionar el SVG para que quepa todo el árbol.
+    */
+    function render() {
+      svg.innerHTML = ""; /* limpiar todo el SVG */
+
+      /* --- Primera pasada: ARISTAS del árbol --- */
+      for (const n of nodes) {
+        if (n.parent == null) continue; /* la raíz no tiene padre */
+        const p = nodes[n.parent];
+        const a = nodePos(p), b = nodePos(n);
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+        line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+        line.setAttribute("stroke", "rgba(148,163,184,.75)"); /* gris claro */
+        line.setAttribute("stroke-width", "2");
+        svg.appendChild(line);
+      }
+
+      /* --- Segunda pasada: NODOS del árbol --- */
+      for (const n of nodes) {
+        const {x, y} = nodePos(n);
+
+        /* Grupo SVG para agrupar círculo + texto con un click handler compartido */
+        const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        g.style.cursor = "pointer";
+
+        /* Círculo del nodo */
+        const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", r);
+        c.setAttribute("fill", colorForStatus(n.status));
+        /* Borde más grueso y oscuro si es el nodo seleccionado */
+        c.setAttribute("stroke", (n.id===selected) ? "rgba(15,23,42,.95)" : "rgba(15,23,42,.25)");
+        c.setAttribute("stroke-width", (n.id===selected) ? "3" : "2");
+
+        /* Etiqueta de texto a la derecha del círculo */
+        const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        t.setAttribute("x", x+16); /* desplazado 16px a la derecha del centro del círculo */
+        t.setAttribute("y", y+4);  /* ligeramente bajado para centrado visual */
+        t.setAttribute("fill", "rgba(15,23,42,.85)");
+        t.setAttribute("font-size", "11");
+        t.setAttribute("font-family", "ui-monospace, monospace");
+        t.textContent = n.label;
+
+        g.appendChild(c); g.appendChild(t);
+        /* Click handler: selecciona el nodo y restaura el coloreo del grafo */
+        g.addEventListener("click", () => selectNode(n.id, true));
+        svg.appendChild(g);
+      }
+
+      resizeToFit(); /* ajustar dimensiones del SVG al contenido */
+    }
+
+    /*
+      resizeToFit(): ajusta el ancho y alto del SVG para que quepa todo el árbol.
+      Calcula la profundidad y el xIndex máximos para determinar el tamaño necesario.
+      Los valores mínimos (900 de ancho, 700 de alto) evitan un SVG demasiado pequeño
+      para grafos con pocos nodos.
+    */
+    function resizeToFit() {
+      const maxDepth = nodes.reduce((m, n) => Math.max(m, n.depth), 0);
+      const maxXIdx  = nodes.reduce((m, n) => Math.max(m, n.xIndex), 0);
+      svg.setAttribute("width",  String(Math.max(900, 140 + (maxXIdx+1)*dx)));
+      svg.setAttribute("height", String(Math.max(700, 140 + (maxDepth+1)*dy)));
+    }
+
+    /*
+      reset(): vaciar completamente el árbol.
+      Se llama al iniciar una nueva búsqueda o al resetear el editor.
+      Restaura las dimensiones iniciales del SVG (1200×900).
+    */
+    function reset() {
+      nodes = []; selected = null;
+      svg.innerHTML = "";
+      svg.setAttribute("width", "1200");
+      svg.setAttribute("height", "900");
+    }
+
+    /*
+      addNode({parent, depth, status, label}):
+      Añade un nuevo nodo al árbol y redibuja.
+
+      El xIndex (posición horizontal) se calcula como el número de nodos
+      que ya existen en la misma profundidad. Esto hace que los nodos de
+      un mismo nivel se distribuyan de izquierda a derecha en el orden
+      en que son creados.
+
+      La raíz (parent=null) siempre obtiene xIndex=0.
+
+      Devuelve el ID del nodo recién creado.
+    */
+    function addNode({parent, depth, status, label}) {
+      const id = nodes.length;
+      /* xIndex: contar cuántos nodos ya hay en este nivel */
+      const xIndex = (parent == null) ? 0 : (nodes.filter(n => n.depth === depth).length);
+      nodes.push({id, parent, depth, status, label, xIndex});
+      render();
+      return id;
+    }
+
+    /*
+      updateStatus(id, status, label=null):
+      Actualiza el estado (y opcionalmente la etiqueta) de un nodo existente.
+      Usado cuando un nodo "live" cambia a "ok", "fail" o "prune"
+      tras procesar su turno en el DFS.
+    */
+    function updateStatus(id, status, label=null) {
+      nodes[id].status = status;
+      if (label) nodes[id].label = label;
+      render();
+    }
+
+    /*
+      selectNode(id, replay=false):
+      Selecciona visualmente un nodo del árbol.
+
+      Si replay=true: aplica la asignación de colores guardada en searchStates[id]
+      al canvas del grafo, restaurando el estado visual del coloreo.
+
+      Actualiza el panel B2 (detalles) con la información del nodo:
+        - Número de nodo, profundidad y estado.
+        - La asignación de colores completa en ese punto del DFS.
+
+      Nota: searchStates es una variable del scope externo, no del módulo tree.
+      Esta es la única dependencia del módulo tree con el exterior.
+    */
+    function selectNode(id, replay=false) {
+      selected = id;
+      render();
+      const st = searchStates.get(id); /* buscar snapshot en el mapa externo */
+      if (st) {
+        if (replay) applyAssignmentToCanvas(st.assignment);
+        /* Construir texto de la asignación: "v1=2, v3=1, v5=4" */
+        const items = [...st.assignment.entries()].map(([v,c]) => `v${v}=${c}`).join(", ");
+        $("nodeDetails").textContent =
+          `Nodo #${id} • depth=${nodes[id].depth} • status=${nodes[id].status}\nAsignación: ${items}`;
+        $("selMeta").textContent = `nodo ${id}`;
+      } else {
+        $("nodeDetails").textContent = `Nodo #${id} (sin snapshot)`;
+        $("selMeta").textContent = `nodo ${id}`;
+      }
+    }
+
+    /*
+      centerSelected():
+      Hace scroll en el contenedor treeWrap para que el nodo seleccionado
+      quede centrado en la vista visible.
+      scrollLeft/scrollTop se calculan como posición_nodo - mitad_viewport.
+      Math.max(0,...) evita valores negativos de scroll.
+    */
+    function centerSelected() {
+      if (selected == null) return;
+      const n = nodes[selected];
+      const {x, y} = nodePos(n);
+      wrap.scrollLeft = Math.max(0, x - wrap.clientWidth/2);
+      wrap.scrollTop  = Math.max(0, y - wrap.clientHeight/2);
+    }
+
+    /*
+      getState() / setState():
+      Serialización del árbol para el sistema de historial (undo/redo).
+      JSON.parse(JSON.stringify(...)) hace una copia profunda del array de nodos,
+      evitando que los snapshots compartan referencias con el estado actual.
+    */
+    function getState() {
+      return {nodes: JSON.parse(JSON.stringify(nodes)), selected};
+    }
+    function setState(st) {
+      nodes    = JSON.parse(JSON.stringify(st.nodes || []));
+      selected = st.selected ?? null;
+      render();
+    }
+
+    /* API pública del módulo tree */
+    return {reset, addNode, updateStatus, selectNode, centerSelected, getState, setState};
+  })();
+
+  /* Conectar el botón "Centrar seleccionado" con la función del módulo tree */
+  $("centerOnSelected").onclick = () => tree.centerSelected();
+
+
+  /*
+    ============================================================
+    SISTEMA DE HISTORIAL (UNDO/REDO) Y ESTADO DE BÚSQUEDA
+    ============================================================
+    El control paso a paso del algoritmo requiere poder retroceder y
+    avanzar por los estados del DFS. Esto se implementa con un sistema
+    de snapshots completos del estado de la aplicación.
+
+    VARIABLES GLOBALES:
+      search:         objeto con el estado actual del algoritmo DFS, o null.
+      searchStates:   Map<nodeId, snapshot> — estado del grafo en cada nodo del árbol.
+      stepSnapshots:  array lineal de snapshots completos (timeline).
+      stepIndex:      posición actual en la timeline.
+
+    Un "snapshot completo" (snapshotWhole) guarda TODO:
+      - V[], E[] con colores actuales.
+      - Contadores vid, eid, modo de edición.
+      - El estado del DFS (pila, contadores, éxito).
+      - El mapa searchStates.
+      - El estado del árbol SVG.
+
+    El historial funciona como una línea de tiempo lineal:
+      - Avanzar al final: calcula un nuevo paso (oneSearchStep).
+      - Avanzar en medio: redo (restaurar snapshot siguiente).
+      - Retroceder: undo (restaurar snapshot anterior).
+      - Si se avanza desde un punto intermedio: trunca el futuro.
+    ============================================================
+  */
+
+  let search = null;                  /* Estado del algoritmo DFS activo, o null */
+  const searchStates = new Map();     /* nodeId → {assignment, domains, currentLayer} */
+  const stepSnapshots = [];           /* Timeline de snapshots para undo/redo */
+  let stepIndex = -1;                 /* Posición actual en la timeline */
+
+  /*
+    applyAssignmentToCanvas(assignment):
+    Aplica un mapa Map<vertexId, colorIndex> al array V[], actualizando
+    el color de cada vértice, y redibuja el canvas.
+    Si un vértice no está en el mapa (no asignado), su color vuelve a 0 (gris).
+  */
+  function applyAssignmentToCanvas(assignment) {
+    V.forEach(v => { v.color = assignment.get(v.id) || 0; });
+    draw();
+  }
+
+
+  /*
+    ============================================================
+    SERIALIZACIÓN DE Map y Set
+    ============================================================
+    JSON.stringify/parse no puede serializar nativamente Map ni Set.
+    Estas funciones convierten entre estructuras nativas y arrays
+    planos que sí son serializables en JSON (para los snapshots).
+    ============================================================
+  */
+
+  /* packMap(m): Map<k,v> → [[k,v], [k,v], ...] */
+  function packMap(m) { return [...m.entries()]; }
+
+  /* packDomains(dom): Map<k, Set<v>> → [[k, [v1,v2,...]], ...] */
+  function packDomains(dom) {
+    return [...dom.entries()].map(([k, set]) => [k, [...set]]);
+  }
+
+  /* unpackMap(arr): [[k,v], ...] → Map<k,v> */
+  function unpackMap(arr) { return new Map(arr); }
+
+  /* unpackDomains(arr): [[k, [v1,v2,...]], ...] → Map<k, Set<v>> */
+  function unpackDomains(arr) {
+    const m = new Map();
+    for (const [k, vals] of arr) m.set(k, new Set(vals));
+    return m;
+  }
+
+  /*
+    packSearchStates(): serializa el mapa completo searchStates.
+    Convierte cada entrada de Map<nodeId, {assignment:Map, domains:Map<Set>, currentLayer}>
+    a un formato serializable.
+  */
+  function packSearchStates() {
+    const out = [];
+    for (const [nodeId, st] of searchStates.entries()) {
+      out.push([nodeId, {
+        assignment:   packMap(st.assignment),
+        domains:      packDomains(st.domains),
+        currentLayer: st.currentLayer
+      }]);
+    }
+    return out;
+  }
+
+  /* unpackSearchStates(arr): restaura searchStates desde su forma serializada */
+  function unpackSearchStates(arr) {
+    searchStates.clear();
+    for (const [nodeId, st] of arr) {
+      searchStates.set(nodeId, {
+        assignment:   unpackMap(st.assignment),
+        domains:      unpackDomains(st.domains),
+        currentLayer: st.currentLayer
+      });
+    }
+  }
+
+  /*
+    snapshotWhole():
+    Captura un snapshot completo del estado de TODA la aplicación en este instante.
+    Se llama al final de cada paso del algoritmo (y al inicializarlo).
+
+    Gestión de la timeline:
+      - stepSnapshots.splice(stepIndex+1): elimina todos los snapshots "futuros"
+        si el usuario retrocedió y luego avanza de nuevo (como un editor de texto:
+        deshacer y luego escribir borra el historial de redo).
+      - stepIndex = length-1: apunta al nuevo snapshot recién guardado.
+      - Actualiza los botones Prev/Next según la posición en la timeline.
+
+    El snapshot incluye DEEP COPIES de todas las estructuras mutables para
+    evitar que modificaciones futuras contaminen los snapshots pasados.
+  */
+  function snapshotWhole() {
+    const snap = {
+      V:    V.map(v => ({id:v.id, x:v.x, y:v.y, color:v.color, layer:v.layer})),
+      E:    E.map(e => ({id:e.id, a:e.a, b:e.b, virtual:e.virtual})),
+      vid, eid,
+      mode, edgePick,
+      /* Serializar el estado del DFS si existe */
+      search: search ? {
+        explored:    search.explored,
+        pruned:      search.pruned,
+        failed:      search.failed,
+        successNode: search.successNode,
+        stack: search.stack.map(s => ({
+          nodeId:       s.nodeId,
+          assignment:   packMap(s.assignment),
+          domains:      packDomains(s.domains),
+          currentLayer: s.currentLayer
+        }))
+      } : null,
+      searchStates: packSearchStates(), /* serializar todos los snapshots de nodos */
+      tree: tree.getState()             /* serializar el árbol SVG */
+    };
+
+    /* Gestión de la timeline: truncar el redo tail */
+    stepSnapshots.splice(stepIndex + 1);
+    stepSnapshots.push(snap);
+    stepIndex = stepSnapshots.length - 1;
+
+    /* Actualizar estado de los botones de navegación */
+    $("prevBtn").disabled = (stepIndex <= 0);
+    $("nextBtn").disabled = false;
+  }
+
+  /*
+    restoreSnapshot(idx):
+    Restaura completamente el estado de la aplicación al snapshot en la posición idx.
+    Se llama al hacer clic en "Paso anterior" o "Siguiente paso" (cuando ya hay redo).
+
+    Proceso:
+      1. Recuperar el snapshot del array.
+      2. Copiar shallowly V[] y E[] (el snapshot ya tiene copias profundas).
+      3. Restaurar contadores, modo, edgePick.
+      4. Restaurar el estado del DFS (reconstruir adj porque los grafos de adyacencia
+         no se serializan, se reconstruyen siempre desde V[] y E[]).
+      5. Restaurar searchStates.
+      6. Restaurar el árbol SVG.
+      7. Redibujar el canvas.
+      8. Actualizar estado de los botones Prev/Next.
+  */
+  function restoreSnapshot(idx) {
+    const snap = stepSnapshots[idx];
+    if (!snap) return;
+
+    V = snap.V.map(v => ({...v})); /* copias shallow de los objetos del snapshot */
+    E = snap.E.map(e => ({...e}));
+    vid = snap.vid; eid = snap.eid;
+    mode = snap.mode;
+    edgePick = snap.edgePick;
+
+    /* Restaurar el estado del DFS si existía */
+    if (snap.search) {
+      search = {
+        adj:         buildAdj(null), /* reconstruir la adyacencia desde V[] y E[] restaurados */
+        explored:    snap.search.explored,
+        pruned:      snap.search.pruned,
+        failed:      snap.search.failed,
+        successNode: snap.search.successNode,
+        stack: snap.search.stack.map(s => ({
+          nodeId:       s.nodeId,
+          assignment:   unpackMap(s.assignment),
+          domains:      unpackDomains(s.domains),
+          currentLayer: s.currentLayer
+        }))
+      };
+    } else {
+      search = null;
+    }
+
+    unpackSearchStates(snap.searchStates);
+    tree.setState(snap.tree);
+
+    draw();
+    $("prevBtn").disabled = (idx <= 0);
+    $("nextBtn").disabled = false;
+  }
+
+
+  /*
+    ============================================================
+    PREPARACIÓN DEL ALGORITMO DE 4-COLOREO
+    ============================================================
+  */
+
+  /*
+    pickCentralTriangle():
+    Selecciona el triángulo más "interno" del grafo para usarlo como
+    punto de partida del coloreo. Los tres vértices del triángulo
+    recibirán los colores fijos 1, 2 y 3 (siempre válido porque son
+    mutuamente adyacentes y necesitan colores distintos).
+
+    ESTRATEGIA DE SELECCIÓN:
+    Entre todas las caras triangulares del grafo (caras con 3 vértices),
+    se elige la que minimiza "innerBias" = 3*maxLayer - suma_de_layers.
+    Esto favorece triángulos cuyos vértices tienen MAYOR número de capa
+    (es decir, están más al interior del grafo, lejos del borde).
+
+    En caso de empate en innerBias, se prefiere el triángulo de menor área
+    (más "compacto" y central).
+
+    Devuelve el ciclo [v1, v2, v3] del triángulo elegido, o null si no
+    hay caras triangulares (grafo no está triangulado).
+  */
+  function pickCentralTriangle() {
+    /* Filtrar solo las caras con exactamente 3 vértices */
+    const faces = facesFromEmbedding(null).filter(f => f.cycle.length === 3);
+    if (!faces.length) return null;
+
+    /* Calcular el layer máximo para normalizar la puntuación */
+    let maxLayer = 0;
+    for (const v of V) if (v.layer != null) maxLayer = Math.max(maxLayer, v.layer);
+
+    /*
+      score(face): calcula la puntuación del triángulo para la selección.
+      innerBias más bajo → triángulo más interno (se prefiere).
+      Menor área en caso de empate.
+    */
+    function score(face) {
+      const layersSum = face.cycle.reduce((s, id) => s + (getVertexById(id).layer || 0), 0);
+      return {innerBias: (3*maxLayer - layersSum), area: Math.abs(face.area)};
+    }
+
+    let best = faces[0], bs = score(best);
+    for (const f of faces) {
+      const s = score(f);
+      if (s.innerBias < bs.innerBias - 1e-9 ||
+          (Math.abs(s.innerBias - bs.innerBias) < 1e-9 && s.area < bs.area)) {
+        best = f; bs = s;
+      }
+    }
+    return best.cycle;
+  }
+
+  /*
+    triangulateWithVirtualEdges():
+    Convierte el grafo planar en un GRAFO PLANAR MAXIMAL (triangulado)
+    añadiendo aristas "virtuales" en las caras no triangulares.
+
+    Un grafo planar maximal es aquel en que todas sus caras internas son triángulos.
+    Esto es necesario para que el algoritmo de coloreo funcione correctamente,
+    ya que se basa en la estructura de caras del grafo.
+
+    ALGORITMO: EAR CLIPPING (recorte de orejas)
+    Para cada cara interna con ≥ 4 vértices:
+      1. Determinar la orientación del polígono (CCW o CW) con área con signo.
+      2. Buscar una "oreja": un vértice convexo tal que el triángulo que forma
+         con sus dos vecinos no contenga ningún otro vértice del polígono.
+      3. Añadir la diagonal entre los dos vecinos de la oreja (arista virtual).
+      4. Eliminar la oreja del ciclo y repetir.
+
+    NOTA: addEdge() ya verifica planaridad, por lo que si una diagonal
+    cruzara otra arista (caso excepcional), se busca otra oreja.
+
+    Funciones geométricas locales:
+      pOf(id): punto {x,y} del vértice con ese ID.
+      orient(a,b,c): orientación del triángulo (producto vectorial).
+      area2OfPoly(poly): doble del área con signo del polígono (para determinar CCW/CW).
+      pointInTri(p,a,b,c): verifica si el punto p está dentro del triángulo (a,b,c)
+        usando el método de orientaciones consistentes.
+  */
+  function triangulateWithVirtualEdges() {
+    /* Eliminar todas las aristas virtuales anteriores antes de recalcular */
+    const before = E.length;
+    E = E.filter(e => !e.virtual);
+    const removed = before - E.length;
+    if (removed > 0) log("INFO", `Eliminadas ${removed} aristas virtuales anteriores.`);
+
+    if (V.length < 3) return 0;
+
+    const faces = facesFromEmbedding(null);
+    if (!faces.length) return 0;
+
+    /* Identificar la cara exterior (mayor |área|) para excluirla de la triangulación */
+    let outer = faces[0];
+    for (const f of faces) {
+      if (Math.abs(f.area) > Math.abs(outer.area)) outer = f;
+    }
+
+    const EPS = 1e-9;
+
+    /* Función auxiliar: obtener punto {x,y} de un vértice por ID */
+    function pOf(id) {
+      const v = getVertexById(id);
+      return {x:v.x, y:v.y};
+    }
+
+    /* Orientación del triángulo (a,b,c): producto vectorial (b-a)×(c-a) */
+    function orient(a, b, c) {
+      return (b.x-a.x)*(c.y-a.y) - (b.y-a.y)*(c.x-a.x);
+    }
+
+    /*
+      area2OfPoly(poly): calcula el DOBLE del área con signo del polígono.
+      Usa la fórmula de la cuadrícula de Gauss (Shoelace formula).
+      Resultado > 0 → polígono en sentido antihorario (CCW).
+      Resultado < 0 → polígono en sentido horario (CW).
+    */
+    function area2OfPoly(poly) {
+      let a = 0;
+      for (let i = 0; i < poly.length; i++) {
+        const A = pOf(poly[i]);
+        const B = pOf(poly[(i+1) % poly.length]);
+        a += A.x*B.y - A.y*B.x;
+      }
+      return a;
+    }
+
+    /*
+      pointInTri(p, a, b, c):
+      Determina si el punto p está DENTRO del triángulo (a,b,c).
+      Método: si todas las orientaciones (a,b,p), (b,c,p), (c,a,p) tienen
+      el mismo signo, el punto está dentro (o en el borde).
+      Si hay orientaciones de signo contrario, el punto está fuera.
+    */
+    function pointInTri(p, a, b, c) {
+      const o1 = orient(a,b,p), o2 = orient(b,c,p), o3 = orient(c,a,p);
+      const hasNeg = (o1 < -EPS) || (o2 < -EPS) || (o3 < -EPS);
+      const hasPos = (o1 >  EPS) || (o2 >  EPS) || (o3 >  EPS);
+      return !(hasNeg && hasPos); /* dentro si no hay mezcla de signos */
+    }
+
+    let added = 0;
+
+    /* Procesar cada cara interna (excluir la exterior) */
+    for (const f of faces) {
+      if (f === outer) continue; /* saltar la cara exterior */
+
+      /* Obtener el ciclo sin duplicados (pueden aparecer por precisión numérica) */
+      let poly = f.cycle.slice();
+      poly = poly.filter((id, idx) => poly.indexOf(id) === idx);
+
+      if (poly.length <= 3) continue; /* ya es triángulo, no necesita triangulación */
+
+      const A2  = area2OfPoly(poly);
+      if (Math.abs(A2) < EPS) continue; /* polígono degenerado (área ≈ 0) */
+      const ccw = (A2 > 0); /* true si el polígono está en orden antihorario */
+
+      let guard = 0; /* límite de iteraciones de seguridad */
+      while (poly.length > 3 && guard++ < 5000) {
+        let earFound = false;
+
+        /* Buscar una "oreja" (ear) en el polígono */
+        for (let i = 0; i < poly.length; i++) {
+          const prevId = poly[(i-1+poly.length) % poly.length];
+          const currId = poly[i];
+          const nextId = poly[(i+1) % poly.length];
+
+          const P = pOf(prevId), C = pOf(currId), N = pOf(nextId);
+
+          /*
+            Verificar convexidad: el vértice currId debe ser convexo
+            respecto a la orientación del polígono.
+            Si el polígono es CCW (A2>0), un vértice convexo tiene orient(P,C,N) > 0.
+            Si el polígono es CW  (A2<0), un vértice convexo tiene orient(P,C,N) < 0.
+          */
+          const o = orient(P, C, N);
+          const convex = ccw ? (o > EPS) : (o < -EPS);
+          if (!convex) continue; /* vértice cóncavo: no es oreja */
+
+          /*
+            Verificar que ningún otro vértice del polígono cae dentro
+            del triángulo (P, C, N). Si hubiera uno, la diagonal (P,N)
+            cortaría al polígono, lo que no está permitido.
+          */
+          let contains = false;
+          for (let j = 0; j < poly.length; j++) {
+            const vid = poly[j];
+            if (vid===prevId || vid===currId || vid===nextId) continue;
+            if (pointInTri(pOf(vid), P, C, N)) { contains=true; break; }
+          }
+          if (contains) continue; /* hay vértice dentro del triángulo: no es oreja válida */
+
+          /* Intentar añadir la diagonal (prevId, nextId) como arista virtual */
+          if (!hasEdge(prevId, nextId)) {
+            /* addEdge verifica planaridad: si la diagonal cruzara otra arista, falla */
+            const ok = addEdge(prevId, nextId, true);
+            if (ok) added++;
+            else continue; /* no se pudo añadir (cruce): buscar otra oreja */
+          }
+
+          /* "Cortar la oreja": eliminar currId del ciclo */
+          poly.splice(i, 1);
+          earFound = true;
+          break; /* reiniciar la búsqueda de orejas con el polígono reducido */
+        }
+
+        if (!earFound) {
+          log("PRUNE", `Triangulación: no se encontró oreja válida en una cara (len=${poly.length}).`);
+          break; /* imposible triangular esta cara (caso degenado), continuar con la siguiente */
+        }
+      }
+    }
+
+    if (added > 0) log("OK", `Triangulación: añadidas ${added} aristas virtuales (punteadas).`);
+    else           log("INFO", "Triangulación: no fue necesario añadir aristas virtuales.");
+    return added;
+  }
+
+
+  /*
+    ============================================================
+    INICIALIZACIÓN DE LA BÚSQUEDA DFS
+    ============================================================
+    initSearch():
+    Prepara el estado inicial del algoritmo de backtracking con 4-coloreo.
+
+    PROCESO:
+      1. Calcular capas (computeLayers) — da contexto de orden al DFS.
+      2. Seleccionar el triángulo más interno (pickCentralTriangle) — punto de partida.
+      3. Asignar colores fijos 1, 2, 3 a los 3 vértices del triángulo.
+         Esta asignación siempre es válida porque los 3 vértices son mutuamente adyacentes
+         y el Teorema de los 4 Colores garantiza que 4 colores bastan.
+      4. Inicializar el dominio de cada vértice no asignado como {1,2,3,4}.
+      5. Propagar las restricciones de los 3 vértices ya coloreados:
+         para cada vecino no asignado de v1/v2/v3, eliminar el color de ese vértice de su dominio.
+      6. Crear el nodo raíz del árbol de búsqueda.
+      7. Guardar el estado inicial en searchStates y en la pila del DFS.
+
+    Devuelve el objeto search con:
+      adj:         grafo de adyacencia (Map<id, [vecinos]>).
+      explored:    contador de nodos expandidos.
+      pruned:      contador de ramas podadas por FC.
+      failed:      contador de nodos con fallo (sin color o sin candidato).
+      successNode: ID del nodo del árbol donde se encontró la solución, o null.
+      stack:       pila DFS — array de estados {nodeId, assignment, domains, currentLayer}.
+    ============================================================
+  */
+  function initSearch() {
+    const layers = computeLayers();
+    if (!layers || !layers.length) return null;
+
+    const tri = pickCentralTriangle();
+    if (!tri) {
+      log("FAIL", "No se encontró triángulo interno (¿grafo maximal/triangulado?).");
+      return null;
+    }
+
+    const [v1, v2, v3] = tri; /* IDs de los 3 vértices del triángulo central */
+    const adj = buildAdj(null);
+
+    /* Asignación inicial fija del triángulo central */
+    const assignment = new Map([[v1,1], [v2,2], [v3,3]]);
+
+    /* Inicializar dominios para todos los vértices NO asignados */
+    const domains = new Map();
+    for (const v of V) {
+      if (assignment.has(v.id)) continue; /* saltar los ya asignados */
+      domains.set(v.id, new Set([1,2,3,4]));
+    }
+
+    /*
+      Propagación inicial de restricciones desde los 3 vértices del núcleo.
+      Para cada vértice ya coloreado, eliminar ese color del dominio de sus vecinos.
+      Esto es la propagación de restricciones del estado inicial.
+    */
+    function applyFrom(id) {
+      const c = assignment.get(id);
+      for (const nb of (adj.get(id) || [])) {
+        if (!domains.has(nb)) continue; /* saltar vecinos ya asignados */
+        domains.get(nb).delete(c);
+      }
+    }
+    applyFrom(v1); applyFrom(v2); applyFrom(v3);
+
+    /* Resetear árbol y estado de búsqueda previos */
+    tree.reset();
+    searchStates.clear();
+    stepSnapshots.length = 0;
+    stepIndex = -1;
+
+    /* Crear el nodo raíz del árbol con la asignación inicial del triángulo */
+    const rootId = tree.addNode({
+      parent: null,
+      depth: 0,
+      status: "live",
+      label: `root: v${v1}=1, v${v2}=2, v${v3}=3`
+    });
+
+    /* Guardar el estado del nodo raíz (copia profunda de assignment y domains) */
+    searchStates.set(rootId, {
+      assignment:   new Map(assignment),
+      domains:      new Map([...domains.entries()].map(([k,s]) => [k, new Set(s)])),
+      currentLayer: Math.max(...V.map(v => v.layer || 1))
+    });
+
+    /* Seleccionar el nodo raíz y mostrar su coloreo en el canvas */
+    tree.selectNode(rootId, true);
+    applyAssignmentToCanvas(assignment);
+
+    log("OK", `Búsqueda iniciada. Núcleo: (${v1},${v2},${v3}) con colores 1,2,3.`);
+
+    /* Retornar el objeto search que manejará la pila del DFS */
+    return {
+      adj,
+      explored: 0, pruned: 0, failed: 0,
+      successNode: null,
+      lastProcessedNodeId:null,
+      stack: [{
+        nodeId: rootId,
+        assignment,
+        domains,
+        currentLayer: Math.max(...V.map(v => v.layer || 1))
+      }]
+    };
+  }
+
+
+  /*
+    ============================================================
+    HEURÍSTICAS DEL ALGORITMO DE BACKTRACKING
+    ============================================================
+  */
+
+  /*
+    orderedColors(state, vid):
+    Devuelve los colores del dominio del vértice vid ordenados por
+    la heurística LCV (Least Constraining Value — valor menos restrictivo).
+
+    IDEA: asignar primero el color que "elimina menos opciones" de los
+    vecinos no asignados. Esto maximiza la flexibilidad futura del algoritmo,
+    reduciendo el número de backtrackings.
+
+    impact(color): cuenta cuántos vecinos no asignados de vid tienen ese
+    color en su dominio. Un impacto menor significa que ese color elimina
+    menos opciones de los vecinos → es el "menos restrictivo".
+
+    Los colores se ordenan de menor a mayor impacto (LCV).
+  */
+  function orderedColors(state, vid) {
+    const dom = state.domains.get(vid);
+    if (!dom) return [];
+    const colors = [...dom].sort((a,b) => a-b); /* orden base: numérico ascendente */
+
+    /* Calcular el impacto de cada color sobre los vecinos no asignados */
+    function impact(color) {
+      let imp = 0;
+      for (const nb of (search.adj.get(vid) || [])) {
+        if (!state.domains.has(nb)) continue; /* vecino ya asignado: ignorar */
+        if (state.domains.get(nb).has(color)) imp++; /* el color está en el dominio del vecino */
+      }
+      return imp;
+    }
+
+    colors.sort((a,b) => impact(a) - impact(b)); /* ordenar por impacto ascendente (LCV) */
+    return colors;
+  }
+
+  /*
+    forwardCheck(state, vid, color):
+    Implementa el FORWARD CHECKING: simula la asignación vid=color y
+    propaga la restricción a todos los vecinos no asignados.
+
+    PROCESO (no destructivo — trabaja sobre copias):
+      1. Hacer una copia profunda de todos los dominios actuales.
+      2. Eliminar vid del mapa de dominios (ya está asignado).
+      3. Para cada vecino nb de vid:
+           a. Si nb ya está asignado, ignorar.
+           b. Eliminar 'color' del dominio de nb.
+           c. Si el dominio de nb queda VACÍO → detectar conflicto:
+              devolver {ok:false, culprit:nb}.
+      4. Si ningún dominio queda vacío: devolver {ok:true}.
+
+    Si devuelve ok:false, la rama se poda (el nodo hijo se añade al árbol
+    como "prune" pero no se apila para explorar).
+
+    Parámetros:
+      state: estado del DFS actual (con .domains).
+      vid:   vértice que se está asignando.
+      color: color que se intenta asignar.
+
+    Devuelve {ok, newDomains, culprit}:
+      ok:         true si la asignación es compatible.
+      newDomains: mapa de dominios actualizado (válido tanto si ok=true como ok=false).
+      culprit:    vértice que quedó sin dominio (solo cuando ok=false).
+  */
+
+function forwardCheck(state, vid, color){
+    const newDomains=new Map();
+    for (const [k,set] of state.domains.entries()) newDomains.set(k,new Set(set));
+    newDomains.delete(vid);
+    for (const nb of (search.adj.get(vid)||[])){
+      if (!newDomains.has(nb)) continue;
+      newDomains.get(nb).delete(color);
+      if (newDomains.get(nb).size===0){
+        // Recopilar qué colores ya tenían los vecinos del culprit
+        // para explicar por qué su dominio quedó vacío
+        const culpritNbs = search.adj.get(nb)||[];
+        const coloresEliminados=[];
+        for (const cnb of culpritNbs){
+          const c=state.assignment.get(cnb);
+          if (c!=null) coloresEliminados.push({vecino:cnb, color:c});
+        }
+        // Añadir el color que acabamos de probar (vid=color)
+        coloresEliminados.push({vecino:vid, color});
+        return {ok:false, newDomains, culprit:nb, coloresEliminados};
+      }
+    }
+    return {ok:true, newDomains, culprit:null, coloresEliminados:[]};
+  }
+
+  /*
+    complete(state):
+    Verifica si la asignación actual cubre TODOS los vértices del grafo.
+    La búsqueda termina con éxito cuando assignment.size === V.length.
+  */
+  function complete(state) { return state.assignment.size === V.length; }
+
+  /*
+    pickNextVertex(state):
+    Elige el próximo vértice a colorear usando dos heurísticas combinadas.
+
+    HEURÍSTICA 1: CAPAS (Layer Priority)
+    Prioriza los vértices de la capa "currentLayer".
+    Si no hay candidatos en esa capa, retrocede a currentLayer-1.
+    Esto extiende el coloreo desde el núcleo (capa más alta) hacia afuera.
+
+    HEURÍSTICA 2: CONECTIVIDAD
+    Solo considera vértices que tienen AL MENOS UN VECINO ya coloreado.
+    Esto asegura que el coloreo avanza de forma conectada desde la región ya coloreada,
+    garantizando que las restricciones de color se puedan aplicar inmediatamente.
+
+    HEURÍSTICA 3: MRV (Minimum Remaining Values)
+    Entre los candidatos válidos, elige el que tiene el MENOR número de
+    colores disponibles en su dominio. Esto prioriza los vértices más
+    difíciles de colorear (con menos opciones), reduciendo el árbol de búsqueda.
+
+    DESEMPATE POR GRADO:
+    Si dos vértices tienen el mismo tamaño de dominio, se prefiere el que
+    tiene mayor grado (más vecinos), ya que tiene más restricciones futuras.
+
+    Devuelve el ID del mejor vértice candidato, o null si no hay candidatos.
+  */
+function pickNextVertex(state){
+    const assigned=state.assignment;
+    const adj=search.adj;
+
+    function candidatesForLayer(L){
+      const cand=[];
+      for (const v of V){
+        if (assigned.has(v.id)) continue;
+        if ((v.layer||1)!==L) continue;
+        let touches=false;
+        for (const nb of (adj.get(v.id)||[])){
+          if (assigned.has(nb)){ touches=true; break; }
+        }
+        if (touches) cand.push(v.id);
+      }
+      return cand;
+    }
+
+    // ── CRITERIO 0 (NUEVO): desde cualquier vértice ya coloreado,
+    //    ¿hay un layer más interno (número mayor) sin colorear alcanzable? ──
+    const maxLayerInGraph = Math.max(...V.map(v=>v.layer||0));
+    if (state.currentLayer < maxLayerInGraph){
+      // Buscar vértices de layers más internos que currentLayer
+      // que ya toquen un vértice asignado
+      const innerCandidates=[];
+      for (const v of V){
+        if (assigned.has(v.id)) continue;
+        const vLayer = v.layer||0;
+        if (vLayer <= state.currentLayer) continue; // solo layers MÁS internos
+        const touches=(adj.get(v.id)||[]).some(nb=>assigned.has(nb));
+        if (touches) innerCandidates.push(v.id);
+      }
+
+      if (innerCandidates.length){
+        // Aplicar MRV + grado sobre los candidatos internos
+        let best=innerCandidates[0];
+        let bestSz=state.domains.get(best)?.size ?? 4;
+        let bestLayer=V.find(x=>x.id===best)?.layer||0;
+        for (const id of innerCandidates){
+          const sz=state.domains.get(id)?.size ?? 4;
+          const vLayer=V.find(x=>x.id===id)?.layer||0;
+          // Primero el layer más interno, luego MRV, luego grado
+          if (vLayer > bestLayer){
+            best=id; bestSz=sz; bestLayer=vLayer;
+          } else if (vLayer===bestLayer){
+            if (sz < bestSz){ best=id; bestSz=sz; }
+            else if (sz===bestSz){
+              if ((adj.get(id)||[]).length>(adj.get(best)||[]).length) best=id;
+            }
+          }
+        }
+        const bestV=V.find(x=>x.id===best);
+        const domStr=[...(state.domains.get(best)||[])].sort().join(",");
+        log("INFO",`[Layer ${bestV.layer}] Prioridad layer interno: expandir v${best} (dominio {${domStr}}, grado=${( adj.get(best)||[]).length})`);
+        return best;
+      }
+    }
+
+    // ── CRITERIOS 1-3 originales: currentLayer → MRV → grado ──
+    let guard=0;
+    while (guard++<200){
+      let cand=candidatesForLayer(state.currentLayer);
+      if (!cand.length){
+        if (state.currentLayer>1){
+          state.currentLayer=Math.max(1,state.currentLayer-1);
+          log("INFO",`Avanzando a Layer ${state.currentLayer}.`);
+          continue;
+        }
+        for (const v of V){
+          if (assigned.has(v.id)) continue;
+          let touches=false;
+          for (const nb of (adj.get(v.id)||[])){
+            if (assigned.has(nb)){ touches=true; break; }
+          }
+          if (touches) cand.push(v.id);
+        }
+      }
+      if (!cand.length) return null;
+
+      let best=cand[0], bestSz=(state.domains.get(best)?.size ?? 4);
+      for (const id of cand){
+        const sz=(state.domains.get(id)?.size ?? 4);
+        if (sz<bestSz){ best=id; bestSz=sz; }
+        else if (sz===bestSz){
+          const d1=(adj.get(id)||[]).length, d2=(adj.get(best)||[]).length;
+          if (d1>d2) best=id;
+        }
+      }
+      const bestV=V.find(x=>x.id===best);
+      const domStr=[...(state.domains.get(best)||[])].sort().join(",");
+      log("INFO",`[Layer ${bestV?.layer??'?'}] Paso: expandir v${best} (dominio {${domStr}}, grado=${( adj.get(best)||[]).length})`);
+      return best;
+    }
+    return null;
+  }
+
+
+  /*
+    ============================================================
+    CORAZÓN DEL ALGORITMO: oneSearchStep()
+    ============================================================
+    Ejecuta UN paso del algoritmo de backtracking con 4-coloreo.
+
+    Esta función implementa un DFS iterativo usando la pila search.stack.
+    Cada llamada procesa exactamente UN estado de la pila.
+
+    FLUJO COMPLETO DE UN PASO:
+      1. Verificar precondiciones (búsqueda iniciada, no ya resuelta).
+      2. Sacar el estado del TOPE de la pila (pop → DFS).
+      3. Incrementar el contador de explorados.
+      4. Guardar snapshot del estado actual en searchStates.
+      5. Si la asignación es COMPLETA → marcar éxito y terminar.
+      6. Elegir el próximo vértice con pickNextVertex() (MRV + capas).
+         Si no hay candidatos → marcar FALLO (rama muerta).
+      7. Si el dominio del vértice elegido está vacío → marcar FALLO.
+      8. Para cada color en el dominio (ordenado por LCV):
+           a. Verificar que no viola restricción directa con vecinos ya asignados.
+           b. Aplicar forward checking para detectar dominios vacíos.
+           c. Si FC detecta dominio vacío → crear nodo "prune" en el árbol (no apilar).
+           d. Si FC pasa → crear nodo "live" en el árbol y APILAR el nuevo estado.
+      9. Si ningún color generó hijos válidos → marcar FALLO en el nodo actual.
+      10. Apilar los hijos en orden INVERSO para que el primero quede en el tope.
+          (DFS de izquierda a derecha: el primer hijo se explora primero.)
+      11. Seleccionar el primer hijo (o el nodo actual si no hay) para mostrar en canvas.
+      12. Guardar snapshot completo de la aplicación.
+    ============================================================
+  */
+
+
+function oneSearchStep(){
+    if (!search){
+      log("FAIL","Primero presiona \"Iniciar búsqueda\".");
+      return;
+    }
+    if (search.successNode!=null){
+      log("OK","Ya existe una solución. Puedes seguir navegando con Paso anterior.");
+      return;
+    }
+
+    const st = search.stack.pop();
+    if (!st){
+      log("FAIL","Búsqueda terminada: no se encontró solución (árbol completo).");
+      return;
+    }
+
+    // ── Detectar backtrack real y detallar paso a paso ──
+    const treeNodes = tree.getState().nodes;
+    const curNode   = treeNodes.find(n=>n.id===st.nodeId);
+    const lastNode  = (search.lastProcessedNodeId!=null)
+                      ? treeNodes.find(n=>n.id===search.lastProcessedNodeId)
+                      : null;
+
+if (lastNode && curNode && curNode.parent !== search.lastProcessedNodeId){
+      const saltosAtras = Math.max(0, lastNode.depth - curNode.depth + 1);
+      const COLOR_NAME={1:"Rojo",2:"Azul",3:"Verde",4:"Amarillo"};
+
+      const assignLast = searchStates.get(search.lastProcessedNodeId)?.assignment || new Map();
+      const assignCur  = searchStates.get(st.nodeId)?.assignment                 || new Map();
+
+      // Vértices que pierden su color
+      const pierdanColor=[];
+      for (const [vid,col] of assignLast.entries()){
+        if (!assignCur.has(vid)){
+          const v=V.find(x=>x.id===vid);
+          pierdanColor.push({id:vid, color:col, layer:v?.layer??'?'});
+        }
+      }
+      pierdanColor.reverse();
+
+      // Vértice donde se retoma con nuevo color
+      const labelMatch=(curNode.label||"").match(/v(\d+)=(\d+)/);
+      const nuevoVid   = labelMatch ? +labelMatch[1] : null;
+      const nuevoColor = labelMatch ? +labelMatch[2] : null;
+
+      // ── Razón raíz del backtrack ──
+      // Buscar el nodo fallido: es el ancestro del último nodo
+      // procesado que causó la cadena de fallas
+      // Su label contiene "Falla" o es el nodo que quedó sin colores
+      let razonRaiz = "";
+      // El nodo que falló es el último procesado o su ancestro inmediato
+      // Lo reconstruimos desde el label del lastNode y los nodos intermedios
+      const nodosIntermedios = pierdanColor.map(p=>`v${p.id}`).join(" → ");
+
+      // Buscar en el árbol el nodo fallido (status=fail) más cercano al lastNode
+      const treeState = tree.getState().nodes;
+      let nodoFallido = null;
+      let buscarId = search.lastProcessedNodeId;
+      for (let i=0; i<saltosAtras+2; i++){
+        const n = treeState.find(x=>x.id===buscarId);
+        if (!n) break;
+        if (n.status==="fail"){
+          nodoFallido = n;
+          break;
+        }
+        buscarId = n.parent;
+      }
+
+      if (nodoFallido){
+        // Extraer qué vértice falló del label
+        const failMatch = (nodoFallido.label||"").match(/v(\d+)/);
+        const failVid   = failMatch ? +failMatch[1] : null;
+        const failV     = failVid ? V.find(x=>x.id===failVid) : null;
+        razonRaiz = `Razón: v${failVid} (Layer ${failV?.layer??'?'}) no pudo recibir ningún color válido`;
+        razonRaiz += ` — todos sus colores fueron bloqueados por sus vecinos asignados.`;
+        razonRaiz += `\n  Cadena de retroceso: ${nodosIntermedios} → v${nuevoVid} (nuevo color).`;
+        razonRaiz += `\n  El algoritmo retrocede hasta v${nuevoVid} porque es el vértice más reciente`;
+        razonRaiz += ` con colores alternativos disponibles en el árbol de búsqueda.`;
+      }
+
+      log("PRUNE",`── BACKTRACK (${saltosAtras} nivel${saltosAtras>1?"es":""}) ──────────────────`);
+
+      pierdanColor.forEach(({id,color,layer})=>{
+        log("PRUNE",`  BACKTRACK: v${id} (Layer ${layer}) pierde Color ${color} [${COLOR_NAME[color]||"?"}]`);
+      });
+
+      if (nuevoVid!==null && nuevoColor!==null){
+        const nuevoV=V.find(x=>x.id===nuevoVid);
+        log("PRUNE",`  RETOMA: v${nuevoVid} (Layer ${nuevoV?.layer??'?'}) recibe nuevo Color ${nuevoColor} [${COLOR_NAME[nuevoColor]||"?"}]`);
+      }
+
+      if (razonRaiz){
+        log("PRUNE",`  ↑ ${razonRaiz}`);
+      }
+
+      log("PRUNE",`──────────────────────────────────────────────`);
+    }
+
+    search.explored++;
+
+    // Guardar snapshot del nodo
+    if (!searchStates.has(st.nodeId)){
+      searchStates.set(st.nodeId,{
+        assignment:new Map(st.assignment),
+        domains:new Map([...st.domains.entries()].map(([k,s])=>[k,new Set(s)])),
+        currentLayer: st.currentLayer
+      });
+    }
+
+    if (complete(st)){
+      search.successNode=st.nodeId;
+      tree.updateStatus(st.nodeId,"ok","ÉXITO ✅");
+      log("OK",`Éxito: coloreo completo. Explorados=${search.explored}, podas=${search.pruned}, fallas=${search.failed}`);
+      tree.selectNode(st.nodeId,true);
+      snapshotWhole();
+      search.lastProcessedNodeId = st.nodeId;
+      return;
+    }
+
+    const next = pickNextVertex(st);
+    if (next==null){
+      search.failed++;
+      tree.updateStatus(st.nodeId,"fail","Falla (sin candidato)");
+      log("FAIL","Falla: no hay candidatos conectados a la región coloreada.");
+      snapshotWhole();
+      search.lastProcessedNodeId = st.nodeId;
+      return;
+    }
+
+    const dom=st.domains.get(next);
+    if (!dom||dom.size===0){
+      search.failed++;
+      tree.updateStatus(st.nodeId,"fail",`Falla: v${next} sin dominio`);
+      log("FAIL",`Falla: v${next} sin colores disponibles.`);
+      snapshotWhole();
+      search.lastProcessedNodeId = st.nodeId;
+      return;
+    }
+
+    // línea duplicada eliminada: pickNextVertex ya genera el log
+
+    const colors=orderedColors(st,next);
+    const children=[];
+    let anyChild=false;
+
+for (const c of colors){
+  let ok=true;
+  for (const nb of (search.adj.get(next)||[])){
+    if (st.assignment.get(nb)===c){ ok=false; break; }
+  }
+  if (!ok){
+    log("INFO",`  v${next}=${c} descartado: conflicto directo con vecino ya coloreado.`);
+    continue;
+  }
+
+  const fc=forwardCheck(st,next,c);
+  const childAssign=new Map(st.assignment);
+  childAssign.set(next,c);
+  const childDepth=(treeNodes.find(n=>n.id===st.nodeId)?.depth ?? 0) + 1;
+
+if (!fc.ok){
+    search.pruned++;
+    const childId=tree.addNode({parent:st.nodeId, depth:childDepth, status:"prune", label:`v${next}=${c} (podado)`});
+    searchStates.set(childId,{assignment:childAssign, domains:fc.newDomains, currentLayer:st.currentLayer});
+
+    const COLOR_NAME={1:"Rojo",2:"Azul",3:"Verde",4:"Amarillo"};
+    const culpritV = V.find(x=>x.id===fc.culprit);
+
+    // Explicar por qué el dominio de culprit quedó vacío
+    // Sus vecinos ya asignados le bloquearon todos los colores
+    const bloqueos = fc.coloresEliminados
+      .map(({vecino,color:col})=>`v${vecino}=${col}[${COLOR_NAME[col]||"?"}]`)
+      .join(", ");
+
+    log("PRUNE",`  ForwardCheck: intentando v${next}=${c}[${COLOR_NAME[c]||"?"}]`);
+    log("PRUNE",`    → v${fc.culprit} (Layer ${culpritV?.layer??'?'}) quedaría sin colores disponibles.`);
+    log("PRUNE",`    → Causa: sus vecinos asignados bloquean todos sus colores: ${bloqueos}`);
+    continue;
+  }
+
+  const COLOR_NAME={1:"Rojo",2:"Azul",3:"Verde",4:"Amarillo"};
+  log("INFO",`  v${next}=${c} [${COLOR_NAME[c]||"?"}] aceptado → nodo hijo creado.`);
+
+  anyChild=true;
+  const childId=tree.addNode({parent:st.nodeId, depth:childDepth, status:"live", label:`v${next}=${c}`});
+  const childState={nodeId:childId, assignment:childAssign, domains:fc.newDomains, currentLayer:st.currentLayer};
+  searchStates.set(childId,{assignment:childAssign, domains:fc.newDomains, currentLayer:st.currentLayer});
+  children.push(childState);
+}
+
+    if (!anyChild){
+      search.failed++;
+      tree.updateStatus(st.nodeId,"fail",`Falla: v${next} sin color`);
+      log("FAIL",`Falla: ningún color válido para v${next}. Todos los colores generan conflicto o poda.`);
+    }
+
+    for (let i=children.length-1;i>=0;i--) search.stack.push(children[i]);
+
+    if (children.length){
+      tree.selectNode(children[0].nodeId,true);
+    } else {
+      tree.selectNode(st.nodeId,true);
+    }
+
+    search.lastProcessedNodeId = st.nodeId;
+    snapshotWhole();
+  }
+
+
+  /*
+    ============================================================
+    CONTROL DE LA UI DEL ALGORITMO
+    ============================================================
+  */
+
+  /*
+    resetSearchUI(keepGraph=false):
+    Reinicia todo el estado relacionado con la búsqueda:
+      - Limpia search, searchStates, stepSnapshots.
+      - Resetea stepIndex a -1.
+      - Deshabilita Prev/Next, habilita startBtn.
+      - Limpia el panel de detalles y la selección del árbol.
+      - Reinicia el árbol SVG.
+      - Si keepGraph=false: además pone todos los vértices a color 0 (gris)
+        y redibuja. Si keepGraph=true: mantiene el grafo tal cual.
+
+    Se llama al borrar vértices/aristas (el grafo cambió → búsqueda inválida),
+    al importar JSON, o al iniciar una nueva búsqueda.
+  */
+  function resetSearchUI(keepGraph=false) {
+    search = null;
+    searchStates.clear();
+    stepSnapshots.length = 0;
+    stepIndex = -1;
+    $("prevBtn").disabled = true;
+    $("nextBtn").disabled = true;
+    $("startBtn").disabled = false;
+    $("selMeta").textContent = "—";
+    $("nodeDetails").textContent = "Haz click en un nodo del árbol para ver el estado del coloreo en el grafo.";
+    tree.reset();
+    if (!keepGraph) {
+      V.forEach(v => v.color = 0); /* resetear colores a gris */
+      draw();
+    }
+  }
+
+  /*
+    Botón "Iniciar búsqueda":
+    Orquesta la inicialización completa del algoritmo:
+      1. resetSearchUI(true): limpiar búsqueda pero mantener el grafo.
+      2. triangulateWithVirtualEdges(): añadir aristas virtuales para triangular.
+      3. draw(): actualizar el canvas con las nuevas aristas virtuales.
+      4. initSearch(): preparar el estado inicial del DFS.
+      5. Si initSearch() falla (no hay triángulo, etc.) → abortar y resetear.
+      6. Deshabilitar startBtn (evitar reinicios accidentales).
+      7. snapshotWhole(): guardar el snapshot 0 (estado inicial).
+      8. Loguear instrucciones de uso.
+  */
+  $("startBtn").onclick = () => {
+    resetSearchUI(true);
+    triangulateWithVirtualEdges();
+    draw();
+    search = initSearch();
+    if (!search) { resetSearchUI(true); return; }
+    $("startBtn").disabled = true;
+    $("nextBtn").disabled = false;
+    $("prevBtn").disabled = true;
+    snapshotWhole(); /* snapshot 0: estado inicial con triángulo coloreado */
+    log("INFO", "Ahora usa \"Siguiente paso\" / \"Paso anterior\" para avanzar o retroceder el algoritmo.");
+  };
+
+  /*
+    Botón "Siguiente paso":
+    Tiene DOS comportamientos según la posición en la timeline:
+
+    1. REDO: si stepIndex < stepSnapshots.length-1
+       El usuario retrocedió previamente y hay "futuro" guardado.
+       En vez de calcular un nuevo paso, restaurar el snapshot siguiente.
+       stepIndex++ y restoreSnapshot(stepIndex).
+
+    2. NUEVO PASO: si estamos al final de la timeline.
+       Calcular el siguiente paso del DFS con oneSearchStep().
+       Esta función, al terminar, llama snapshotWhole() internamente.
+  */
+  $("nextBtn").onclick = () => {
+    if (stepIndex < stepSnapshots.length - 1) {
+      /* REDO: restaurar snapshot siguiente */
+      stepIndex++;
+      restoreSnapshot(stepIndex);
+      return;
+    }
+    /* NUEVO PASO: calcular y ejecutar */
+    oneSearchStep();
+  };
+
+  /*
+    Botón "Paso anterior":
+    UNDO: retrocede un paso en la timeline.
+    stepIndex-- y restoreSnapshot(stepIndex).
+    Si ya estamos en el primer snapshot (stepIndex=0), no hace nada.
+  */
+  $("prevBtn").onclick = () => {
+    if (stepIndex <= 0) return;
+    stepIndex--;
+    restoreSnapshot(stepIndex);
+  };
+
+
+  /*
+    ============================================================
+    INICIALIZACIÓN DE LA APLICACIÓN
+    ============================================================
+    Se ejecuta al cargar la página (inmediatamente, gracias a la IIFE).
+
+    1. setCanvasSize(): establece las dimensiones físicas del canvas (960×720px).
+    2. draw(): dibuja el canvas inicial: solo la cuadrícula, sin vértices ni aristas.
+
+    A partir de aquí, la aplicación espera eventos del usuario.
+    ============================================================
+  */
+  setCanvasSize();
+  draw();
+
+})(); /* Fin de la IIFE */
+</script>
+</body>
+</html>
