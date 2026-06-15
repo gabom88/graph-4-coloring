@@ -34,12 +34,6 @@ Todo corre en el navegador, sin servidor, sin build y sin librerías externas: b
   - **Forward Checking** para detectar dominios vacíos antes de explorar.
 - **Control manual paso a paso**: el usuario avanza y retrocede cada decisión.
 
-### 3. Árbol de búsqueda en SVG
-- Se construye y actualiza conforme el algoritmo avanza.
-- Nodos coloreados según su estado: **vivo** (azul), **podado** (naranja), **fallo** (rojo), **éxito** (verde).
-- Al hacer clic en un nodo, el grafo se restaura al coloreo de ese instante.
-- Historial completo con **deshacer / rehacer** mediante *snapshots* serializados.
-
 ## Cómo usarlo
 
 No requiere instalación ni dependencias.
