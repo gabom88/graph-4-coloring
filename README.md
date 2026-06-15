@@ -74,7 +74,6 @@ Puedes guardar tu trabajo con **Exportar JSON** y recuperarlo con **Importar JSO
 | Calcular Layers | Generar las capas por cara exterior |
 | Iniciar búsqueda | Comenzar el coloreo con backtracking |
 | Paso anterior / Siguiente paso | Avanzar y retroceder en la ejecución |
-| Centrar seleccionado | Enfocar el nodo elegido en el árbol |
 
 ## Stack técnico
 
