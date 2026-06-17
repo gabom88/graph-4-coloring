@@ -15,6 +15,14 @@ Una aplicación de página única (Single Page Application) que integra tres sis
 
 Todo corre en el navegador, sin servidor, sin build y sin librerías externas: basta abrir el archivo `.html`.
 
+---
+
+## Versión en linea
+
+Puede utilizar completamente el programa aquí: https://gabom88.github.io/graph-4-coloring/
+
+---
+
 ## Características principales
 
 ### 1. Editor de grafos planares
